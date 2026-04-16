@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  recommendation-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=redis://redis:6379/0
+      - ENVIRONMENT=production
+    depends_on:
+      - redis
+    volumes:
+      - ./app:/app/app
+      - ./workers:/app/workers
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
+
+  recommendation-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=redis://redis:6379/0
+      - ENVIRONMENT=production
+      - WORKER_TYPE=precompute
+    depends_on:
+      - redis
+    volumes:
+      - ./workers:/app/workers
+    command: python -m workers.precompute_worker
+
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:
