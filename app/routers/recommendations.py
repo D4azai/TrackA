@@ -1,274 +1,214 @@
 """
-FastAPI routers for recommendations API
-Exposed endpoints for Next.js integration
+Recommendation API Endpoints — Production Ready
+
+Endpoints:
+- GET /products — Get product recommendations for a seller
+- GET /health — Health check for load balancers
+- POST /cache/clear — Clear recommendation cache (protect in production)
 """
 
-from fastapi import APIRouter, Depends, Query, HTTPException, status
-from sqlalchemy.orm import Session
-from typing import List, Optional
 import logging
 import time
+from typing import List, Optional
 
-from ..db import get_db
-from ..services.algorithm import RecommendationEngine
-from ..services.cache_service import CacheService
-from ..schemas import RecommendationRequest, RecommendationResponse, ProductRecommendation
+from fastapi import APIRouter, Query, HTTPException, Depends
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from app.db import get_db
+from app.services.algorithm import RecommendationEngine
+from app.services.cache_service import CacheService
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/recommend", tags=["recommendations"])
+settings = get_settings()
 
-# Global cache service
+
+# ==================== SCHEMAS ====================
+
+class RecommendationSource(BaseModel):
+    """Breakdown of recommendation score by signal."""
+    popularity: float = Field(..., ge=0, description="Popularity signal contribution")
+    history: float = Field(..., ge=0, description="History signal contribution")
+    recency: float = Field(..., ge=0, description="Recency signal contribution")
+    newness: float = Field(..., ge=0, description="Newness signal contribution")
+    engagement: float = Field(..., ge=0, description="Engagement signal contribution")
+
+
+class Recommendation(BaseModel):
+    """Single product recommendation."""
+    product_id: int
+    score: float = Field(..., ge=0, le=100, description="Final recommendation score")
+    rank: int = Field(..., ge=1, description="Ranking position")
+    sources: RecommendationSource = Field(..., description="Score breakdown by signal")
+
+
+class RecommendationResponse(BaseModel):
+    """API response with recommendations."""
+    seller_id: str
+    recommendations: List[Recommendation]
+    count: int = Field(..., ge=0, description="Number of recommendations")
+    cache_hit: bool = Field(default=False, description="Whether result came from cache")
+    elapsed_ms: Optional[float] = Field(None, description="Time to compute (milliseconds)")
+
+
+class HealthResponse(BaseModel):
+    """Health check response."""
+    status: str
+    service: str
+    version: str
+
+
+# ==================== ROUTER ====================
+
+router = APIRouter()
 cache_service = CacheService()
 
 
-@router.get("/health", response_model=dict)
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "cache_available": cache_service.is_available()
-    }
+def get_recommendation_engine(db: Session = Depends(get_db)) -> RecommendationEngine:
+    """Dependency injection for recommendation engine."""
+    return RecommendationEngine(db)
 
 
-@router.get("/products", response_model=RecommendationResponse)
-async def get_product_recommendations(
-        seller_id: str = Query(..., description="The seller requesting recommendations"),
-        limit: int = Query(20, ge=1, le=100, description="Max products to return"),
-        exclude_ids: Optional[str] = Query(None, description="Comma-separated product IDs to exclude"),
-        db: Session = Depends(get_db)
-):
+# ==================== ENDPOINTS ====================
+
+@router.get(
+    "/products",
+    response_model=RecommendationResponse,
+    summary="Get product recommendations for a seller",
+    tags=["Recommendations"]
+)
+async def get_recommendations(
+    seller_id: str = Query(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Seller ID requesting recommendations"
+    ),
+    limit: int = Query(
+        30,
+        ge=1,
+        le=100,
+        description="Number of recommendations (1-100)"
+    ),
+    engine: RecommendationEngine = Depends(get_recommendation_engine)
+) -> RecommendationResponse:
     """
-    Get product recommendations for a seller
+    Get intelligent product recommendations for a seller.
 
-    Query Parameters:
-    - seller_id (required): Seller UUID
-    - limit: Number of products (1-100, default 20)
-    - exclude_ids: Comma-separated IDs like "1,2,3" to exclude from results
+    Algorithm: Weighted ensemble of 5 signals
+    - Popularity (25%): Global trending products
+    - History (35%): Seller's past orders
+    - Recency (20%): When seller last ordered (seller-specific)
+    - Newness (15%): Product age
+    - Engagement (5%): Likes and comments
 
     Example:
-        GET /api/recommend/products?seller_id=seller123&limit=20&exclude_ids=1,2,3
-
-    Response:
-        {
-            "seller_id": "seller123",
-            "recommendations": [
-                {
-                    "product_id": 42,
-                    "name": "Premium Fabric",
-                    "code": "FAB-001",
-                    "score": 87.5,
-                    "rank": 1,
-                    "category_id": 5,
-                    "selling_price": 99.99,
-                    "rating_stars": 4,
-                    "sources": {
-                        "popularity": 85.0,
-                        "history": 90.0,
-                        "engagement": 70.0,
-                        "recency": 95.0,
-                        "newness": 60.0
-                    }
-                }
-            ],
-            "count": 20,
-            "generated_at": "2024-01-15T10:30:00Z",
-            "cache_hit": false
-        }
+    ```
+    GET /api/recommend/products?seller_id=seller123&limit=30
+    ```
     """
     try:
         start_time = time.time()
 
-        # Validate seller_id
-        if not seller_id or not seller_id.strip():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="seller_id is required"
-            )
-
-        # Parse exclude_ids
-        exclude_product_ids = []
-        if exclude_ids:
-            try:
-                exclude_product_ids = [int(id.strip()) for id in exclude_ids.split(",")]
-            except ValueError:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="exclude_ids must be comma-separated integers"
-                )
-
         # Check cache first
         cache_hit = False
-        cached_recommendations = cache_service.get_recommendations(seller_id)
+        if settings.cache_enabled:
+            cached = cache_service.get_recommendations(seller_id)
+            if cached:
+                cache_hit = True
+                logger.info(f"Cache hit for seller {seller_id}")
+                limited = cached[:limit]
+                elapsed = time.time() - start_time
+                return RecommendationResponse(
+                    seller_id=seller_id,
+                    recommendations=[Recommendation(**r) for r in limited],
+                    count=len(limited),
+                    cache_hit=True,
+                    elapsed_ms=round(elapsed * 1000, 2)
+                )
 
-        if cached_recommendations:
-            cache_hit = True
-            recommendations = cached_recommendations
-            logger.info(f"Served {len(recommendations)} recommendations from cache for {seller_id}")
-        else:
-            # Compute recommendations
-            engine = RecommendationEngine(db)
-            recommendations = await engine.compute_recommendations(
-                seller_id=seller_id,
-                limit=limit,
-                exclude_product_ids=exclude_product_ids
-            )
+        # Compute recommendations
+        recommendations = engine.compute_recommendations(seller_id, limit)
 
-            # Add product details
-            recommendations = engine.add_product_details(recommendations)
-
-            # Cache the results
-            cache_service.set_recommendations(seller_id, recommendations)
-
-        # Apply exclude filter (in case it wasn't used during computation)
-        if exclude_product_ids:
-            recommendations = [
-                r for r in recommendations
-                if r['product_id'] not in exclude_product_ids
-            ][:limit]
-
+        # Build response
         elapsed = time.time() - start_time
-
         response = RecommendationResponse(
             seller_id=seller_id,
             recommendations=[
-                ProductRecommendation(**rec) for rec in recommendations
+                Recommendation(**r) if isinstance(r, dict) else r
+                for r in recommendations
             ],
             count=len(recommendations),
-            cache_hit=cache_hit,
+            cache_hit=False,
             elapsed_ms=round(elapsed * 1000, 2)
         )
 
+        # Cache result
+        if settings.cache_enabled:
+            cache_service.set_recommendations(seller_id, recommendations, settings.cache_ttl_seconds)
+
         return response
 
-    except HTTPException:
-        raise
+    except ValueError as e:
+        logger.warning(f"Validation error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error computing recommendations for {seller_id}: {str(e)}")
+        logger.error(f"Error getting recommendations: {str(e)}", exc_info=True)
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=500,
             detail="Failed to compute recommendations"
         )
 
 
-@router.post("/invalidate", response_model=dict)
-async def invalidate_cache(
-        seller_id: Optional[str] = Query(None),
-        product_id: Optional[int] = Query(None),
-        all: bool = Query(False)
-):
+@router.get(
+    "/health",
+    response_model=HealthResponse,
+    summary="Health check",
+    tags=["Health"]
+)
+async def health_check() -> HealthResponse:
     """
-    Invalidate recommendation caches
-
-    Call this when:
-    - User places an order (invalidate their seller cache)
-    - Product is created/modified (invalidate popular products)
-    - System-wide updates (use all=true)
-
-    Query Parameters:
-    - seller_id: Invalidate cache for specific seller
-    - product_id: Invalidate popular products cache (used when product is ordered)
-    - all: Invalidate all caches (use sparingly)
-
-    Example:
-        POST /api/recommend/invalidate?seller_id=seller123
-        POST /api/recommend/invalidate?product_id=42
-        POST /api/recommend/invalidate?all=true
+    Simple health check endpoint for load balancers.
+    No authentication required.
+    Returns 200 if service is operational.
     """
-    try:
-        invalidated = False
-
-        if all:
-            cache_service.invalidate_all()
-            invalidated = True
-            logger.info("Invalidated all recommendation caches")
-        elif seller_id:
-            cache_service.invalidate_seller(seller_id)
-            invalidated = True
-            logger.info(f"Invalidated cache for seller {seller_id}")
-        elif product_id:
-            cache_service.invalidate_product(product_id)
-            invalidated = True
-            logger.info(f"Invalidated cache due to product {product_id}")
-
-        return {
-            "success": invalidated,
-            "message": "Cache invalidated" if invalidated else "No cache invalidated"
-        }
-
-    except Exception as e:
-        logger.error(f"Error invalidating cache: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to invalidate cache"
-        )
+    return HealthResponse(
+        status="healthy",
+        service="recommendation-engine",
+        version="2.0.0"
+    )
 
 
-@router.get("/debug/popular", response_model=dict)
-async def debug_popular_products(
-        limit: int = Query(50, ge=1, le=100),
-        db: Session = Depends(get_db)
-):
+@router.post(
+    "/cache/clear",
+    summary="Clear recommendation cache",
+    tags=["Admin"]
+)
+async def clear_cache(
+    seller_id: Optional[str] = Query(
+        None,
+        description="Optional: clear only specific seller's cache"
+    )
+) -> dict:
     """
-    DEBUG ENDPOINT: Get popular products (unscoped)
+    Clear cached recommendations.
 
-    Shows trending products across all sellers.
-    Used for debugging and monitoring popularity algorithm.
+    SECURITY: This endpoint should be protected with API key or JWT in production!
+
+    Parameters:
+    - seller_id: If provided, clears only that seller's cache.
+                If not provided, clears all cached recommendations.
     """
     try:
-        from ..services.data_service import DataService
-
-        data_service = DataService(db)
-        popular = data_service.get_popular_products(
-            seller_id="",  # Not needed for this query
-            limit=limit
-        )
-
-        return {
-            "popular_products": popular,
-            "count": len(popular)
-        }
-
+        if seller_id:
+            cache_service.delete(seller_id)
+            logger.info(f"Cleared cache for seller {seller_id}")
+            return {"status": "cleared", "seller_id": seller_id}
+        else:
+            cache_service.clear_all()
+            logger.info("Cleared all caches")
+            return {"status": "cleared", "scope": "all"}
     except Exception as e:
-        logger.error(f"Error fetching popular products: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch popular products"
-        )
-
-
-@router.get("/debug/seller/{seller_id}", response_model=dict)
-async def debug_seller_data(
-        seller_id: str,
-        db: Session = Depends(get_db)
-):
-    """
-    DEBUG ENDPOINT: Get seller's recommendation data
-
-    Shows all signals used in recommendation computation for this seller.
-    Useful for understanding why certain products are recommended.
-    """
-    try:
-        from ..services.data_service import DataService
-
-        data_service = DataService(db)
-
-        # Get all data signals
-        popular = data_service.get_popular_products(seller_id, limit=20)
-        history = data_service.get_seller_order_history(seller_id)
-        categories = data_service.get_seller_category_preferences(seller_id)
-        prefs = data_service.get_seller_preferences_from_db(seller_id)
-
-        return {
-            "seller_id": seller_id,
-            "popular_products": popular,
-            "order_history_count": len(history),
-            "category_preferences": categories,
-            "stored_preferences": prefs
-        }
-
-    except Exception as e:
-        logger.error(f"Error fetching seller debug data: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch seller data"
-        )
+        logger.error(f"Error clearing cache: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to clear cache")

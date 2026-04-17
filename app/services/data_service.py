@@ -1,60 +1,68 @@
 """
-Data service for fetching recommendation-relevant data from PostgreSQL
+Data Service Layer — Batch Database Queries
+
+Provides all data fetching for the recommendation algorithm.
+All queries are optimized:
+- No N+1 patterns (batch operations)
+- Proper JOINs and GROUP BY
+- Seller-scoped signals where appropriate
 """
 
-from sqlalchemy.orm import Session
-from sqlalchemy import and_, func, desc
-from datetime import datetime, timedelta
-from typing import List, Dict, Any
 import logging
+from datetime import datetime, timedelta
+from typing import Dict, List
 
-from ..models import Order, OrderItem, Product, ProductReaction, ProductComment, SellerPreferences, Category
-from ..config import settings
+from sqlalchemy import func, and_, desc
+from sqlalchemy.orm import Session
+
+from app.models import Order, OrderItem, Product, ProductReaction, ProductComment
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 
 class DataService:
-    """Service for querying recommendation data"""
+    """
+    Database query layer for recommendations.
 
-    def __init__(self, db: Session):
-        self.db = db
+    All queries optimized for performance:
+    - No N+1 patterns
+    - Batch operations where possible
+    - Proper JOINs and GROUP BY
+    - Seller-scoped signals (not global)
+    """
+
+    def __init__(self, db_session: Session):
+        self.db = db_session
+        self.settings = settings
+
+    # ==================== POPULARITY SIGNALS ====================
 
     def get_popular_products(
-            self,
-            seller_id: str,
-            days: int = 30,
-            limit: int = 50
-    ) -> List[Dict[str, Any]]:
+        self,
+        limit: int = 20,
+        days: int = 30
+    ) -> List[Dict]:
         """
-        Get popular products based on order frequency and quantity (last N days)
+        Get popular products based on recent order volume.
 
-        Scoring formula:
-        - 60% weight on order frequency (how many orders)
-        - 40% weight on total quantity (how much quantity)
+        Uses: Order count + quantity in specified time period.
+        Scope: ALL sellers (global popularity).
 
         Args:
-            seller_id: The seller requesting recommendations
-            days: Number of days to look back (default 30)
-            limit: Maximum products to return (default 50)
+            limit: Maximum products to return
+            days: Lookback period (default 30 days)
 
         Returns:
-            List of dicts with structure:
-            [
-                {
-                    'product_id': int,
-                    'order_count': int,
-                    'total_quantity': int,
-                    'score': float (0-100)
-                }
-            ]
+            List of dicts with product_id, order_count, total_quantity, score
+
+        Query: 1 DB query (batch SELECT with GROUP BY)
         """
         try:
             cutoff_date = datetime.utcnow() - timedelta(days=days)
 
-            # Subquery: count orders and sum quantity per product
-            # Include orders in relevant statuses (not RETURNED or NOT_CONFIRMED)
-            result = self.db.query(
+            results = self.db.query(
                 OrderItem.productId,
                 func.count(OrderItem.orderId).label('order_count'),
                 func.sum(OrderItem.quantity).label('total_quantity')
@@ -71,109 +79,60 @@ class DataService:
                 desc(func.count(OrderItem.orderId))
             ).limit(limit).all()
 
-            # Normalize and score
-            products = []
-            for product_id, order_count, total_quantity in result:
-                # Normalize to 0-100
-                # Assuming max 100 orders and 500 quantity in 30 days for normalization
+            popular = []
+            for product_id, order_count, total_qty in results:
+                # Popularity score: weighted combination of frequency and quantity
                 order_score = min((order_count / 100) * 100, 100)
-                quantity_score = min((total_quantity / 500) * 100, 100)
+                qty_score = min((total_qty / 500) * 100, 100)
+                score = (order_score * 0.6) + (qty_score * 0.4)
 
-                # Hybrid score: 60% frequency, 40% quantity
-                final_score = (order_score * 0.6) + (quantity_score * 0.4)
-
-                products.append({
+                popular.append({
                     'product_id': product_id,
-                    'order_count': order_count,
-                    'total_quantity': total_quantity,
-                    'score': round(final_score, 2)
+                    'order_count': int(order_count),
+                    'total_quantity': int(total_qty),
+                    'score': round(score, 2)
                 })
 
-            logger.info(f"Found {len(products)} popular products for seller {seller_id}")
-            return products
+            logger.info(f"Found {len(popular)} popular products")
+            return popular
 
         except Exception as e:
             logger.error(f"Error getting popular products: {str(e)}")
             return []
 
+    # ==================== SELLER HISTORY SIGNALS ====================
+
     def get_seller_order_history(
-            self,
-            seller_id: str,
-            days: int = 90
-    ) -> Dict[int, Dict[str, Any]]:
+        self,
+        seller_id: str,
+        days: int = 90,
+        limit: int = 100
+    ) -> Dict[int, Dict]:
         """
-        Get seller's order history to identify preferred products
+        Get seller's order history with category preferences.
+
+        Args:
+            seller_id: Seller ID
+            days: Lookback period (default 90 days)
+            limit: Max products to return
 
         Returns:
-            Dict mapping product_id to {
-                'category_id': int,
-                'order_count': int,
-                'total_quantity': int,
-                'last_ordered_at': datetime
-            }
+            Dict mapping product_id to {category_id, order_count, total_quantity, category_score}
+
+        Query: 1 DB query (batch SELECT)
         """
         try:
             cutoff_date = datetime.utcnow() - timedelta(days=days)
 
-            result = self.db.query(
+            results = self.db.query(
                 Product.id,
-                Product.categoryId,
-                func.count(OrderItem.orderId).label('order_count'),
-                func.sum(OrderItem.quantity).label('total_quantity'),
-                func.max(Order.createdAt).label('last_ordered_at')
-            ).join(
-                Order, Order.id == OrderItem.orderId
-            ).join(
-                Product, Product.id == OrderItem.productId
-            ).filter(
-                and_(
-                    Order.sellerId == seller_id,
-                    Order.createdAt >= cutoff_date,
-                    Order.status.in_(['CONFIRMED', 'COMPLETED', 'IN_DELIVERY', 'PROCESSING'])
-                )
-            ).group_by(
-                Product.id,
-                Product.categoryId
-            ).all()
-
-            history = {}
-            for product_id, category_id, order_count, total_quantity, last_ordered in result:
-                history[product_id] = {
-                    'category_id': category_id,
-                    'order_count': order_count,
-                    'total_quantity': total_quantity,
-                    'last_ordered_at': last_ordered
-                }
-
-            logger.info(f"Found {len(history)} previously ordered products for seller {seller_id}")
-            return history
-
-        except Exception as e:
-            logger.error(f"Error getting seller order history: {str(e)}")
-            return {}
-
-    def get_seller_category_preferences(
-            self,
-            seller_id: str,
-            days: int = 90
-    ) -> Dict[int, float]:
-        """
-        Calculate category preference scores from order history
-
-        Returns:
-            Dict mapping category_id to score (0-100)
-        """
-        try:
-            cutoff_date = datetime.utcnow() - timedelta(days=days)
-
-            result = self.db.query(
                 Product.categoryId,
                 func.count(OrderItem.orderId).label('order_count'),
                 func.sum(OrderItem.quantity).label('total_quantity')
             ).join(
-                Order, Order.id == OrderItem.orderId
+                OrderItem, OrderItem.productId == Product.id
             ).join(
-                Product, Product.id == OrderItem.productId
+                Order, Order.id == OrderItem.orderId
             ).filter(
                 and_(
                     Order.sellerId == seller_id,
@@ -181,204 +140,290 @@ class DataService:
                     Order.status.in_(['CONFIRMED', 'COMPLETED', 'IN_DELIVERY', 'PROCESSING'])
                 )
             ).group_by(
+                Product.id,
                 Product.categoryId
-            ).all()
+            ).order_by(
+                desc(func.count(OrderItem.orderId))
+            ).limit(limit).all()
 
-            # Calculate scores normalized to 0-100
-            category_scores = {}
-            for category_id, order_count, total_quantity in result:
-                # Score = (order_count * 0.7) + (quantity * 0.3)
-                # Normalize both to 0-100 scale
-                order_score = min((order_count / 50) * 100, 100)
-                qty_score = min((total_quantity / 200) * 100, 100)
+            history = {}
+            for product_id, category_id, order_count, total_qty in results:
+                score = min((order_count / 20) * 100, 100)
+                qty_boost = min((total_qty / 200) * 20, 20)
+                category_score = min(score + qty_boost, 100)
 
-                score = (order_score * 0.7) + (qty_score * 0.3)
-                category_scores[category_id] = round(score, 2)
+                history[product_id] = {
+                    'category_id': category_id,
+                    'order_count': int(order_count),
+                    'total_quantity': int(total_qty),
+                    'category_score': round(category_score, 2)
+                }
 
-            logger.info(f"Calculated categories for seller {seller_id}: {len(category_scores)} categories")
-            return category_scores
+            logger.info(f"Found {len(history)} products in seller history")
+            return history
 
         except Exception as e:
-            logger.error(f"Error calculating category preferences: {str(e)}")
+            logger.error(f"Error getting seller history: {str(e)}")
             return {}
 
-    def get_engagement_score(
-            self,
-            product_id: int,
-            days: int = 30
-    ) -> float:
+    # ==================== ENGAGEMENT SIGNALS (BATCH) ====================
+
+    def get_engagement_scores_batch(
+        self,
+        product_ids: List[int],
+        days: int = 30
+    ) -> Dict[int, Dict]:
         """
-        Calculate engagement score for a product (likes + comments)
+        Get engagement scores for MULTIPLE products in ONE query.
+
+        Fixes N+1 problem: Before 20 products = 20 queries
+                          After 20 products = 1 query
+
+        Args:
+            product_ids: List of product IDs to score
+            days: Lookback period for reactions/comments
 
         Returns:
-            Score from 0-100
+            Dict mapping product_id to {reactions, comments, engagement_score}
+
+        Query: 1 DB query (batch LEFT JOIN)
         """
+        if not product_ids:
+            return {}
+
         try:
             cutoff_date = datetime.utcnow() - timedelta(days=days)
 
-            reactions = self.db.query(func.count(ProductReaction.id)).filter(
-                ProductReaction.productId == product_id,
-                ProductReaction.createdAt >= cutoff_date
-            ).scalar() or 0
-
-            comments = self.db.query(func.count(ProductComment.id)).filter(
-                ProductComment.productId == product_id,
-                ProductComment.createdAt >= cutoff_date
-            ).scalar() or 0
-
-            # Score: reactions weighted 70%, comments 30%
-            reaction_score = min((reactions / 100) * 100, 100)
-            comment_score = min((comments / 50) * 100, 100)
-
-            score = (reaction_score * 0.7) + (comment_score * 0.3)
-            return round(score, 2)
-
-        except Exception as e:
-            logger.error(f"Error calculating engagement score: {str(e)}")
-            return 0.0
-
-    def get_recency_score(
-            self,
-            product_id: int
-    ) -> float:
-        """
-        Calculate recency score: how recently was this product ordered
-
-        Returns:
-            Score from 0-100 (100 = ordered today, 0 = not ordered in 90 days)
-        """
-        try:
-            last_order = self.db.query(
-                func.max(Order.createdAt)
-            ).join(
-                OrderItem, Order.id == OrderItem.orderId
+            results = self.db.query(
+                OrderItem.productId,
+                func.count(ProductReaction.id).label('reaction_count'),
+                func.count(ProductComment.id).label('comment_count')
+            ).outerjoin(
+                ProductReaction,
+                (ProductReaction.productId == OrderItem.productId) &
+                (ProductReaction.createdAt >= cutoff_date)
+            ).outerjoin(
+                ProductComment,
+                (ProductComment.productId == OrderItem.productId) &
+                (ProductComment.createdAt >= cutoff_date)
             ).filter(
-                OrderItem.productId == product_id,
-                Order.status.in_(['CONFIRMED', 'COMPLETED', 'IN_DELIVERY', 'PROCESSING'])
-            ).scalar()
+                OrderItem.productId.in_(product_ids)
+            ).group_by(
+                OrderItem.productId
+            ).all()
 
-            if not last_order:
-                return 0.0
+            engagement_data = {}
+            for product_id, reactions, comments in results:
+                reaction_score = min((reactions / 100) * 100, 100) if reactions else 0
+                comment_score = min((comments / 50) * 100, 100) if comments else 0
+                engagement_score = (reaction_score * 0.7) + (comment_score * 0.3)
 
-            days_ago = (datetime.utcnow() - last_order).days
+                engagement_data[product_id] = {
+                    'reactions': int(reactions) if reactions else 0,
+                    'comments': int(comments) if comments else 0,
+                    'engagement_score': round(engagement_score, 2)
+                }
 
-            # Exponential decay: very recent = high score, older = lower
-            # 0 days ago = 100, 1 day = 98, 7 days = 70, 30 days = 20, 90+ days = 0
-            if days_ago == 0:
-                score = 100
-            elif days_ago <= 30:
-                score = 100 - (days_ago * 2.67)  # 30 days = ~20 points
-            else:
-                score = max(0, 20 - ((days_ago - 30) * 0.22))  # Gradual decay after 30 days
+            # Add missing products with zero engagement
+            for pid in product_ids:
+                if pid not in engagement_data:
+                    engagement_data[pid] = {
+                        'reactions': 0,
+                        'comments': 0,
+                        'engagement_score': 0.0
+                    }
 
-            return round(min(max(score, 0), 100), 2)
-
-        except Exception as e:
-            logger.error(f"Error calculating recency score: {str(e)}")
-            return 0.0
-
-    def get_newness_score(
-            self,
-            product_id: int
-    ) -> float:
-        """
-        Calculate newness score: how recently was this product added
-
-        Returns:
-            Score from 0-100 (100 = added today, 0 = added 180+ days ago)
-        """
-        try:
-            product = self.db.query(Product).filter(Product.id == product_id).first()
-
-            if not product:
-                return 0.0
-
-            days_old = (datetime.utcnow() - product.createdAt).days
-
-            # Decay over 6 months
-            # 0 days old = 100, 30 days = 80, 90 days = 40, 180+ days = 0
-            if days_old <= 30:
-                score = 100 - (days_old * 0.67)  # Steep decay
-            elif days_old <= 90:
-                score = 80 - ((days_old - 30) * 1.33)  # Medium decay
-            else:
-                score = max(0, 40 - ((days_old - 90) * 0.22))  # Gradual decay
-
-            return round(min(max(score, 0), 100), 2)
+            return engagement_data
 
         except Exception as e:
-            logger.error(f"Error calculating newness score: {str(e)}")
-            return 0.0
+            logger.error(f"Error getting engagement scores: {str(e)}")
+            return {pid: {'reactions': 0, 'comments': 0, 'engagement_score': 0.0}
+                    for pid in product_ids}
 
-    def get_product_details(
-            self,
-            product_ids: List[int]
-    ) -> Dict[int, Dict[str, Any]]:
+    # ==================== RECENCY SIGNALS (BATCH) - SELLER SCOPED ====================
+
+    def get_recency_scores_batch(
+        self,
+        seller_id: str,
+        product_ids: List[int]
+    ) -> Dict[int, Dict]:
         """
-        Fetch product details needed for final recommendations
+        Get SELLER-SCOPED recency scores for MULTIPLE products.
+
+        Uses seller-specific recency: when did THIS SELLER last order each product.
+        Not global recency (which would be the same for all sellers).
+
+        Args:
+            seller_id: Seller ID for scoping
+            product_ids: List of product IDs
 
         Returns:
-            Dict mapping product_id to {
-                'name': str,
-                'code': str,
-                'category_id': int,
-                'selling_price': float,
-                'rating_stars': int,
-                'is_public': bool
-            }
-        """
-        try:
-            if not product_ids:
-                return {}
+            Dict mapping product_id to {last_ordered_at, days_ago, recency_score}
 
-            results = self.db.query(Product).filter(
+        Query: 1 DB query (batch LEFT JOIN)
+        """
+        if not product_ids:
+            return {}
+
+        try:
+            results = self.db.query(
+                OrderItem.productId,
+                func.max(Order.createdAt).label('last_ordered_at')
+            ).join(
+                Order, Order.id == OrderItem.orderId
+            ).filter(
+                and_(
+                    OrderItem.productId.in_(product_ids),
+                    Order.sellerId == seller_id,
+                    Order.status.in_(['CONFIRMED', 'COMPLETED', 'IN_DELIVERY', 'PROCESSING'])
+                )
+            ).group_by(
+                OrderItem.productId
+            ).all()
+
+            recency_data = {}
+            now = datetime.utcnow()
+
+            for product_id, last_ordered in results:
+                if last_ordered:
+                    days_ago = (now - last_ordered).days
+                else:
+                    days_ago = 999
+
+                # Piecewise linear decay: recent = high, old = low
+                # 0 days ago = 100, 30 days = ~20, 90+ = 0
+                if days_ago == 0:
+                    score = 100.0
+                elif days_ago <= 30:
+                    score = 100 - (days_ago * 2.67)
+                else:
+                    score = max(0, 20 - ((days_ago - 30) * 0.22))
+
+                recency_data[product_id] = {
+                    'last_ordered_at': last_ordered,
+                    'days_ago': days_ago,
+                    'recency_score': round(min(max(score, 0), 100), 2)
+                }
+
+            # Add products never ordered by THIS seller
+            for pid in product_ids:
+                if pid not in recency_data:
+                    recency_data[pid] = {
+                        'last_ordered_at': None,
+                        'days_ago': 999,
+                        'recency_score': 0.0
+                    }
+
+            return recency_data
+
+        except Exception as e:
+            logger.error(f"Error getting recency scores: {str(e)}")
+            return {pid: {'last_ordered_at': None, 'days_ago': 999, 'recency_score': 0.0}
+                    for pid in product_ids}
+
+    # ==================== NEWNESS SIGNALS (BATCH) ====================
+
+    def get_newness_scores_batch(
+        self,
+        product_ids: List[int]
+    ) -> Dict[int, Dict]:
+        """
+        Get newness scores for MULTIPLE products.
+
+        Args:
+            product_ids: List of product IDs
+
+        Returns:
+            Dict mapping product_id to {created_at, days_old, newness_score}
+
+        Query: 1 DB query (simple SELECT with WHERE IN)
+        """
+        if not product_ids:
+            return {}
+
+        try:
+            results = self.db.query(
+                Product.id,
+                Product.createdAt
+            ).filter(
                 Product.id.in_(product_ids)
             ).all()
 
-            details = {}
-            for product in results:
-                details[product.id] = {
-                    'name': product.name,
-                    'code': product.code,
-                    'category_id': product.categoryId,
-                    'selling_price': product.sellingPrice,
-                    'rating_stars': product.ratingStars,
-                    'is_public': product.isPublic
+            newness_data = {}
+            now = datetime.utcnow()
+
+            for product_id, created_at in results:
+                if created_at:
+                    days_old = (now - created_at).days
+                else:
+                    days_old = 999
+
+                # Linear decay: new = high, old = low
+                # 0 days old = 100, 180 days old = 0
+                score = max(0, 100 - ((days_old / 180) * 100))
+
+                newness_data[product_id] = {
+                    'created_at': created_at,
+                    'days_old': days_old,
+                    'newness_score': round(score, 2)
                 }
 
-            return details
+            # Add missing products
+            for pid in product_ids:
+                if pid not in newness_data:
+                    newness_data[pid] = {
+                        'created_at': None,
+                        'days_old': 999,
+                        'newness_score': 0.0
+                    }
+
+            return newness_data
 
         except Exception as e:
-            logger.error(f"Error fetching product details: {str(e)}")
-            return {}
+            logger.error(f"Error getting newness scores: {str(e)}")
+            return {pid: {'created_at': None, 'days_old': 999, 'newness_score': 0.0}
+                    for pid in product_ids}
 
-    def get_seller_preferences_from_db(
-            self,
-            seller_id: str
-    ) -> Dict[str, Any]:
+    # ==================== PRODUCT DETAILS ====================
+
+    def get_product_details(
+        self,
+        product_ids: List[int]
+    ) -> Dict[int, Dict]:
         """
-        Fetch precomputed seller preferences from database
+        Get product details for recommendation display.
+
+        Args:
+            product_ids: List of product IDs
 
         Returns:
-            SellerPreferences dict or empty dict if not found
+            Dict mapping product_id to {name, code, price, category, rating}
         """
-        try:
-            prefs = self.db.query(SellerPreferences).filter(
-                SellerPreferences.sellerId == seller_id
-            ).first()
+        if not product_ids:
+            return {}
 
-            if not prefs:
-                logger.warning(f"No preferences found for seller {seller_id}")
-                return {}
+        try:
+            results = self.db.query(
+                Product.id,
+                Product.name,
+                Product.code,
+                Product.sellingPrice,
+                Product.categoryId,
+                Product.ratingStars
+            ).filter(
+                Product.id.in_(product_ids)
+            ).all()
 
             return {
-                'category_scores': prefs.categoryScores,
-                'price_range_min': prefs.priceRangeMin,
-                'price_range_max': prefs.priceRangeMax,
-                'total_orders': prefs.totalOrders,
-                'computed_at': prefs.computedAt
+                p.id: {
+                    'name': p.name,
+                    'code': p.code,
+                    'selling_price': float(p.sellingPrice) if p.sellingPrice else 0,
+                    'category_id': p.categoryId,
+                    'rating_stars': float(p.ratingStars) if p.ratingStars else 0
+                }
+                for p in results
             }
-
         except Exception as e:
-            logger.error(f"Error fetching seller preferences: {str(e)}")
+            logger.error(f"Error getting product details: {str(e)}")
             return {}

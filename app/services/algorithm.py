@@ -1,155 +1,169 @@
 """
-Core recommendation algorithm
-Hybrid scoring approach combining multiple signals
+Recommendation Algorithm — Production Ready
+
+Weighted ensemble of 5 signals:
+1. Popularity (25%): Global trending products
+2. History (35%): Seller's past orders (strongest signal)
+3. Recency (20%): When seller last ordered (seller-scoped)
+4. Newness (15%): Product age
+5. Engagement (5%): Likes and comments
+
+Performance: ~5 database queries total
+Response time target: <200ms
 """
 
-from sqlalchemy.orm import Session
-from typing import List, Dict, Any
 import logging
+from typing import List, Dict
 
-from .data_service import DataService
-from ..config import settings
+from sqlalchemy.orm import Session
+
+from app.config import get_settings
+from app.services.data_service import DataService
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 
 class RecommendationEngine:
-    """Main recommendation algorithm"""
+    """
+    Production recommendation engine.
 
-    def __init__(self, db: Session):
-        self.db = db
-        self.data_service = DataService(db)
-        self.config = settings
+    Algorithm: Weighted ensemble of 5 signals
+    - Popularity (25%): Global trending products
+    - History (35%): Seller's past orders (strongest signal)
+    - Recency (20%): When seller last ordered (seller-scoped)
+    - Newness (15%): Product age
+    - Engagement (5%): Likes and comments
+    """
 
-    async def compute_recommendations(
-            self,
-            seller_id: str,
-            limit: int = 20,
-            exclude_product_ids: List[int] = None
-    ) -> List[Dict[str, Any]]:
+    def __init__(self, db_session: Session):
+        self.db = db_session
+        self.data_service = DataService(db_session)
+        self.settings = settings
+
+    def compute_recommendations(
+        self,
+        seller_id: str,
+        limit: int = 30
+    ) -> List[Dict]:
         """
-        Compute product recommendations for a seller
-
-        Hybrid algorithm combining:
-        - Popularity (25%): What sells fast
-        - History (35%): What seller ordered before
-        - Engagement (5%): Likes/comments
-        - Recency (20%): Recently ordered products
-        - Newness (15%): Recently added products
+        Compute recommendations for a seller.
 
         Args:
-            seller_id: The seller requesting recommendations
-            limit: Number of products to return (default 20)
-            exclude_product_ids: Products to exclude (already in cart, etc.)
+            seller_id: Seller making request
+            limit: Number of recommendations (max 100)
 
         Returns:
-            List of recommended products with scores, sorted by score descending
-            [
-                {
-                    'product_id': int,
-                    'score': float (0-100),
-                    'rank': int,
-                    'sources': {
-                        'popularity': float,
-                        'history': float,
-                        'engagement': float,
-                        'recency': float,
-                        'newness': float
-                    }
-                }
-            ]
+            List of recommendations with product_id, score, rank, and signal breakdown
+
+        Database queries:
+        1. get_popular_products()
+        2. get_seller_order_history()
+        3. get_engagement_scores_batch()
+        4. get_recency_scores_batch()
+        5. get_newness_scores_batch()
+
+        Total: 5 queries per request
         """
+        logger.info(f"Computing recommendations for seller {seller_id}, limit={limit}")
+
         try:
-            exclude_ids = exclude_product_ids or []
+            # Validate limit
+            limit = min(limit, self.settings.max_limit)
+            limit = max(limit, 1)
 
-            logger.info(f"Computing recommendations for seller {seller_id}, limit={limit}")
-
-            # --- Phase 1: Fetch data ---
-            popular_products = self.data_service.get_popular_products(
-                seller_id,
-                days=30,
-                limit=100  # Get more candidates
+            # ========== STEP 1: GATHER CANDIDATES ==========
+            popular = self.data_service.get_popular_products(
+                limit=limit * 2  # Get 2x to have enough after filtering
             )
 
-            seller_history = self.data_service.get_seller_order_history(seller_id, days=90)
+            history = self.data_service.get_seller_order_history(
+                seller_id,
+                limit=limit * 2
+            )
 
-            # Collect all candidate product IDs
-            all_product_ids = list(set(
-                [p['product_id'] for p in popular_products] +
-                list(seller_history.keys())
-            ))
+            # Build popularity lookup dict for O(1) access (instead of O(n) linear scan)
+            popularity_map = {
+                item['product_id']: item['score']
+                for item in popular
+            }
 
-            # Remove excluded products
-            candidate_ids = [p for p in all_product_ids if p not in exclude_ids]
+            # Combine: products from both sources
+            candidate_ids = set()
+            for item in popular:
+                candidate_ids.add(item['product_id'])
+            for product_id in history.keys():
+                candidate_ids.add(product_id)
+
+            candidate_ids = list(candidate_ids)[:limit * 2]
+
+            if not candidate_ids:
+                logger.warning(f"No candidate products found for seller {seller_id}")
+                return []
 
             logger.info(f"Collected {len(candidate_ids)} candidate products")
 
-            # --- Phase 2: Calculate scores for each product ---
+            # ========== STEP 2: BATCH SCORE ALL SIGNALS ==========
+            engagement_data = self.data_service.get_engagement_scores_batch(candidate_ids)
+            recency_data = self.data_service.get_recency_scores_batch(seller_id, candidate_ids)
+            newness_data = self.data_service.get_newness_scores_batch(candidate_ids)
+
+            # ========== STEP 3: SCORE EACH PRODUCT ==========
+            weights = {
+                'popularity': self.settings.weight_popularity,
+                'history': self.settings.weight_history,
+                'recency': self.settings.weight_recency,
+                'newness': self.settings.weight_newness,
+                'engagement': self.settings.weight_engagement
+            }
             scored_products = []
 
             for product_id in candidate_ids:
-                # Initialize scores
-                popularity_score = 0.0
-                history_score = 0.0
-                engagement_score = 0.0
-                recency_score = 0.0
-                newness_score = 0.0
+                # 1. POPULARITY (25%): Global trending — O(1) dict lookup
+                popularity_score = popularity_map.get(product_id, 0.0)
 
-                # Popularity: from popular_products list
-                popular_item = next(
-                    (p for p in popular_products if p['product_id'] == product_id),
-                    None
-                )
-                if popular_item:
-                    popularity_score = popular_item['score']
+                # 2. HISTORY (35%): Seller's past orders (strongest signal)
+                history_score = history.get(product_id, {}).get('category_score', 0.0)
 
-                # History: if seller ordered it before
-                if product_id in seller_history:
-                    history_item = seller_history[product_id]
-                    # Score based on order frequency (0-100)
-                    # Normalize: assume max 20 orders in history
-                    history_score = min((history_item['order_count'] / 20) * 100, 100)
+                # 3. RECENCY (20%): When seller last ordered (seller-scoped)
+                recency_score = recency_data[product_id]['recency_score']
 
-                # Engagement: likes and comments
-                engagement_score = self.data_service.get_engagement_score(product_id)
+                # 4. NEWNESS (15%): Product age
+                newness_score = newness_data[product_id]['newness_score']
 
-                # Recency: when was it last ordered
-                recency_score = self.data_service.get_recency_score(product_id)
+                # 5. ENGAGEMENT (5%): Likes and comments
+                engagement_score = engagement_data[product_id]['engagement_score']
 
-                # Newness: when was it added
-                newness_score = self.data_service.get_newness_score(product_id)
-
-                # --- Phase 3: Weighted hybrid score ---
+                # Weighted sum
                 final_score = (
-                        (popularity_score * self.config.weight_popularity) +
-                        (history_score * self.config.weight_history) +
-                        (engagement_score * self.config.weight_engagement) +
-                        (recency_score * self.config.weight_recency) +
-                        (newness_score * self.config.weight_newness)
+                    popularity_score * weights['popularity'] +
+                    history_score * weights['history'] +
+                    recency_score * weights['recency'] +
+                    newness_score * weights['newness'] +
+                    engagement_score * weights['engagement']
                 )
 
-                # Normalize to 0-100
-                final_score = min(max(final_score, 0), 100)
+                # Apply score threshold
+                if final_score >= self.settings.min_score_threshold:
+                    scored_products.append({
+                        'product_id': product_id,
+                        'score': round(final_score, 2),
+                        'sources': {
+                            'popularity': round(popularity_score * weights['popularity'], 2),
+                            'history': round(history_score * weights['history'], 2),
+                            'recency': round(recency_score * weights['recency'], 2),
+                            'newness': round(newness_score * weights['newness'], 2),
+                            'engagement': round(engagement_score * weights['engagement'], 2)
+                        }
+                    })
 
-                scored_products.append({
-                    'product_id': product_id,
-                    'score': round(final_score, 2),
-                    'sources': {
-                        'popularity': round(popularity_score, 2),
-                        'history': round(history_score, 2),
-                        'engagement': round(engagement_score, 2),
-                        'recency': round(recency_score, 2),
-                        'newness': round(newness_score, 2)
-                    }
-                })
-
-            # --- Phase 4: Sort and limit ---
+            # ========== STEP 4: RANK AND RETURN TOP N ==========
             scored_products.sort(key=lambda x: x['score'], reverse=True)
             recommendations = scored_products[:limit]
 
-            # Add rank
-            for idx, rec in enumerate(recommendations, 1):
-                rec['rank'] = idx
+            # Add ranking
+            for i, rec in enumerate(recommendations, 1):
+                rec['rank'] = i
 
             logger.info(
                 f"Generated {len(recommendations)} recommendations for seller {seller_id}, "
@@ -159,89 +173,5 @@ class RecommendationEngine:
             return recommendations
 
         except Exception as e:
-            logger.error(f"Error computing recommendations: {str(e)}")
-            raise
-
-    def filter_by_seller_visibility(
-            self,
-            products: List[Dict[str, Any]],
-            seller_id: str
-    ) -> List[Dict[str, Any]]:
-        """
-        Filter products by visibility rules
-
-        - Only public products (isPublic=True)
-        - Only products seller is allowed to buy
-        - Only AVAILABLE status
-
-        Args:
-            products: Recommended products with details
-            seller_id: The requesting seller
-
-        Returns:
-            Filtered products list
-        """
-        try:
-            product_ids = [p['product_id'] for p in products]
-            product_details = self.data_service.get_product_details(product_ids)
-
-            filtered = []
-            for product in products:
-                details = product_details.get(product['product_id'])
-
-                if not details:
-                    continue
-
-                # Check visibility rules
-                if not details['is_public']:
-                    continue
-
-                # Check if seller is allowed (allowedSellerIds is empty = all allowed)
-                allowed_sellers = product.get('allowed_seller_ids', [])
-                if allowed_sellers and seller_id not in allowed_sellers:
-                    continue
-
-                filtered.append(product)
-
-            logger.info(f"Filtered {len(products)} products → {len(filtered)} visible to seller {seller_id}")
-            return filtered
-
-        except Exception as e:
-            logger.error(f"Error filtering by visibility: {str(e)}")
-            return products  # Return unfiltered on error
-
-    def add_product_details(
-            self,
-            products: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """
-        Enrich recommendations with product details
-
-        Args:
-            products: Recommended products (requires product_id)
-
-        Returns:
-            Products with added details: name, code, category_id, price, rating
-        """
-        try:
-            product_ids = [p['product_id'] for p in products]
-            details = self.data_service.get_product_details(product_ids)
-
-            enriched = []
-            for product in products:
-                detail = details.get(product['product_id'])
-                if detail:
-                    product.update({
-                        'name': detail['name'],
-                        'code': detail['code'],
-                        'category_id': detail['category_id'],
-                        'selling_price': detail['selling_price'],
-                        'rating_stars': detail['rating_stars']
-                    })
-                    enriched.append(product)
-
-            return enriched
-
-        except Exception as e:
-            logger.error(f"Error adding product details: {str(e)}")
-            return products
+            logger.error(f"Error computing recommendations: {str(e)}", exc_info=True)
+            return []

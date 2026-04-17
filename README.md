@@ -48,9 +48,9 @@ KEY FILES
 
 Core Implementation:
 - app/main.py                      Main FastAPI app
-- app/routers/recommendations_v2.py   Production API endpoints
-- app/services/algorithm_v2.py         Recommendation algorithm
-- app/services/data_service_v2.py      Batch database queries
+- app/routers/recommendations.py   Production API endpoints
+- app/services/algorithm.py         Recommendation algorithm
+- app/services/data_service.py      Batch database queries
 - app/services/cache_service.py        Redis caching
 
 Configuration:
@@ -68,8 +68,8 @@ Documentation:
 - API.md                           API documentation (if exists)
 
 Tests:
-- tests/test_algorithm_v2.py        Algorithm unit tests
-- tests/test_data_service_v2.py     Data service tests
+- tests/test_algorithm.py        Algorithm unit tests
+- tests/test_data_service.py     Data service tests
 - scripts/load_test.py              Performance testing
 - scripts/compare_versions.py       v1 vs v2 comparison
 
@@ -222,8 +222,8 @@ prisma studio
 Run tests:
 ```bash
 pytest tests/ -v
-pytest tests/test_algorithm_v2.py -v    # Specific test file
-pytest tests/test_algorithm_v2.py::test_scoring -v    # Specific test
+pytest tests/test_algorithm.py -v    # Specific test file
+pytest tests/test_algorithm.py::test_scoring -v    # Specific test
 ```
 
 Check database health:
@@ -247,7 +247,7 @@ Issue: 500 errors in logs
   2. Check table existence: SELECT * FROM products LIMIT 1;
   3. Check column names: \d orders (in psql)
   4. Check indexes: SELECT * FROM pg_indexes
-  Solution: Run data_service_v2.get_schema_info() to check setup
+  Solution: Run data_service.get_schema_info() to check setup
 
 Issue: Recommendations are low quality
   1. Check seller has order history:
@@ -255,7 +255,7 @@ Issue: Recommendations are low quality
   2. Check products have engagement:
      SELECT COUNT(*) FROM reactions WHERE product_id > 0;
   3. Verify scores are non-zero:
-     Add logging to algorithm_v2.py and check signal values
+     Add logging to algorithm.py and check signal values
   4. Check algorithm weights sum to 1.0:
      WEIGHT_POPULARITY + WEIGHT_HISTORY + ... = 1.0
 
