@@ -75,38 +75,68 @@ export async function GET(req: NextRequest) {
 - It validates against `ADMIN_API_KEY`.
 - In production, if `ADMIN_API_KEY` is missing, the endpoint is disabled.
 
-## 5) Grafana rollout plan
+## 5) Grafana setup (implemented + runbook)
 
-Grafana needs a metrics source (typically Prometheus). Recommended path:
+The codebase now includes Prometheus metrics and local Grafana/Prometheus services.
 
-1. Add Prometheus metrics endpoint in FastAPI:
-   - request count by route/status
-   - request latency histogram
-   - recommendation compute latency
-   - cache hit/miss counters
-   - DB query duration histogram
-2. Deploy Prometheus to scrape the app metrics endpoint.
-3. Connect Grafana to Prometheus.
-4. Build dashboards:
-   - API latency p50/p95/p99
-   - error rate
-   - requests per second
-   - recommendation compute time
-   - cache hit ratio
-5. Add alert rules:
-   - p95 latency above threshold
-   - 5xx rate above threshold
-   - cache hit ratio below threshold
-   - DB connection saturation
+Implemented:
+- FastAPI metrics endpoint: `GET /metrics` (in `app/main.py`).
+- HTTP metrics:
+  - `http_requests_total{method,path,status_code}`
+  - `http_request_duration_seconds{method,path}`
+- Recommendation metrics:
+  - `recommendation_compute_duration_seconds{cache_hit}`
+  - `recommendation_cache_total{result="hit|miss"}`
+- Prometheus config: `monitoring/prometheus.yml`
+- Docker services in `docker-compose.yml`:
+  - `prometheus` on `http://localhost:9090`
+  - `grafana` on `http://localhost:3001`
 
-## 6) Suggested metrics naming
+### Run locally
+
+```bash
+docker compose up --build
+```
+
+Then open:
+- API metrics: `http://localhost:8000/metrics`
+- Prometheus: `http://localhost:9090`
+- Grafana: `http://localhost:3001` (default `admin` / `admin`)
+
+The repository also auto-provisions:
+- Prometheus datasource (`monitoring/grafana/provisioning/datasources/prometheus.yml`)
+- Dashboard provider (`monitoring/grafana/provisioning/dashboards/dashboards.yml`)
+- Ready dashboard (`monitoring/grafana/dashboards/recommendation-overview.json`)
+
+### Connect Grafana to Prometheus
+
+In Grafana:
+1. Go to **Connections** -> **Data sources** -> **Add data source**.
+2. Choose **Prometheus**.
+3. URL:
+   - If Grafana runs via this compose file: `http://prometheus:9090`
+   - If Grafana runs outside compose: `http://localhost:9090`
+4. Save & test.
+
+### Starter dashboard queries
+
+- Request rate (RPS):
+  - `sum(rate(http_requests_total[5m]))`
+- 5xx error rate:
+  - `sum(rate(http_requests_total{status_code=~"5.."}[5m]))`
+- P95 API latency:
+  - `histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, path))`
+- Recommendation compute P95:
+  - `histogram_quantile(0.95, sum(rate(recommendation_compute_duration_seconds_bucket[5m])) by (le, cache_hit))`
+- Cache hit ratio:
+  - `sum(rate(recommendation_cache_total{result="hit"}[5m])) / sum(rate(recommendation_cache_total[5m]))`
+
+## 6) Metrics naming used
 
 - `http_requests_total`
 - `http_request_duration_seconds`
 - `recommendation_compute_duration_seconds`
-- `recommendation_cache_hits_total`
-- `recommendation_cache_misses_total`
-- `db_query_duration_seconds`
+- `recommendation_cache_total` (label `result=hit|miss`)
 
 ## 7) Deployment checklist for Next.js + API
 

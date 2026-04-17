@@ -20,6 +20,7 @@ from app.db import get_db
 from app.services.algorithm import RecommendationEngine
 from app.services.cache_service import CacheService
 from app.config import get_settings
+from app.metrics import RECOMMENDATION_CACHE_TOTAL, RECOMMENDATION_COMPUTE_DURATION_SECONDS
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -140,9 +141,11 @@ async def get_recommendations(
             cached = cache_service.get_recommendations(seller_id)
             if cached:
                 cache_hit = True
+                RECOMMENDATION_CACHE_TOTAL.labels(result="hit").inc()
                 logger.info(f"Cache hit for seller {seller_id}")
                 limited = cached[:limit]
                 elapsed = time.time() - start_time
+                RECOMMENDATION_COMPUTE_DURATION_SECONDS.labels(cache_hit="true").observe(elapsed)
                 return RecommendationResponse(
                     seller_id=seller_id,
                     recommendations=[Recommendation(**r) for r in limited],
@@ -151,11 +154,14 @@ async def get_recommendations(
                     elapsed_ms=round(elapsed * 1000, 2)
                 )
 
+            RECOMMENDATION_CACHE_TOTAL.labels(result="miss").inc()
+
         # Compute recommendations
         recommendations = engine.compute_recommendations(seller_id, limit)
 
         # Build response
         elapsed = time.time() - start_time
+        RECOMMENDATION_COMPUTE_DURATION_SECONDS.labels(cache_hit="false").observe(elapsed)
         response = RecommendationResponse(
             seller_id=seller_id,
             recommendations=[

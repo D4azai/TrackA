@@ -73,6 +73,23 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
+## Prometheus + Grafana
+
+This project now exposes Prometheus metrics at `GET /metrics`.
+
+To run app + Redis + Prometheus + Grafana:
+
+```bash
+docker compose up --build
+```
+
+Endpoints:
+- App: `http://localhost:8000`
+- Prometheus: `http://localhost:9090`
+- Grafana: `http://localhost:3001` (`admin` / `admin`)
+
+For full setup and dashboard queries, see `docs/PROJECT_WORKFLOW_NEXTJS_GRAFANA.md`.
+
 ## Environment variables
 
 See `.env.example` for all supported settings.
