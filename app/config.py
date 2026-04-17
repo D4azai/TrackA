@@ -7,10 +7,10 @@ No hardcoded credentials or secrets.
 """
 
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 from functools import lru_cache
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,10 @@ class Settings(BaseSettings):
         default=["localhost", "127.0.0.1"],
         description="Allowed Host header values"
     )
+    admin_api_key: Optional[str] = Field(
+        default=None,
+        description="API key required for admin endpoints (X-API-Key header)"
+    )
 
     # ============= ALGORITHM =============
     weight_popularity: float = Field(default=0.25, ge=0, le=1, description="Popularity signal weight")
@@ -67,10 +71,11 @@ class Settings(BaseSettings):
     enable_batch_queries: bool = Field(default=True, description="Use batch queries instead of N+1")
     enable_seller_scoped_signals: bool = Field(default=True, description="Use seller-specific signal scoping")
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = False
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+    )
 
     @property
     def algorithm_weights(self) -> Dict[str, float]:

@@ -9,9 +9,10 @@ Endpoints:
 
 import logging
 import time
+import secrets
 from typing import List, Optional
 
-from fastapi import APIRouter, Query, HTTPException, Depends
+from fastapi import APIRouter, Query, HTTPException, Depends, Header
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -68,6 +69,28 @@ cache_service = CacheService()
 def get_recommendation_engine(db: Session = Depends(get_db)) -> RecommendationEngine:
     """Dependency injection for recommendation engine."""
     return RecommendationEngine(db)
+
+
+def verify_admin_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
+    """
+    Protect admin endpoints with API key.
+    - In production, ADMIN_API_KEY must be configured and provided.
+    - In non-production, if ADMIN_API_KEY is configured it is enforced.
+    """
+    configured_key = settings.admin_api_key
+
+    if settings.is_production and not configured_key:
+        logger.error("Admin endpoint blocked: ADMIN_API_KEY missing in production")
+        raise HTTPException(
+            status_code=503,
+            detail="Admin endpoint disabled: ADMIN_API_KEY is not configured"
+        )
+
+    if configured_key and not x_api_key:
+        raise HTTPException(status_code=401, detail="Missing X-API-Key header")
+
+    if configured_key and not secrets.compare_digest(x_api_key, configured_key):
+        raise HTTPException(status_code=403, detail="Invalid API key")
 
 
 # ==================== ENDPOINTS ====================
@@ -189,12 +212,13 @@ async def clear_cache(
     seller_id: Optional[str] = Query(
         None,
         description="Optional: clear only specific seller's cache"
-    )
+    ),
+    _: None = Depends(verify_admin_api_key)
 ) -> dict:
     """
     Clear cached recommendations.
 
-    SECURITY: This endpoint should be protected with API key or JWT in production!
+    SECURITY: Protected by X-API-Key (ADMIN_API_KEY).
 
     Parameters:
     - seller_id: If provided, clears only that seller's cache.
