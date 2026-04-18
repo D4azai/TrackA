@@ -1,112 +1,63 @@
-# Recommendation Service
+# Recommendation Service (TrackA)
 
-FastAPI service that returns personalized product recommendations for sellers.
+FastAPI microservice that returns **personalized product recommendations** for sellers.
 
-## What this service does
+- **API**: `GET /api/recommend/products?seller_id=<id>&limit=<n>`
+- **Caching**: Redis (graceful деградация if Redis is down)
+- **Observability**: Prometheus metrics at `GET /metrics` + optional Grafana dashboard
 
-- Exposes recommendation APIs under `/api/recommend`.
-- Computes a weighted score per product using:
-  - popularity
-  - seller order history
-  - seller-specific recency
-  - product newness
-  - engagement
-- Caches recommendation responses in Redis for faster repeated reads.
+## Documentation (A → Z)
 
-## Tech stack
+Start here:
+- **Docs index**: `docs/README.md`
+- **System design**: `docs/system-design.md`
+- **Diagrams**: `docs/diagrams.md` (Mermaid)
 
-- Python 3.11
-- FastAPI + Uvicorn
-- SQLAlchemy + PostgreSQL
-- Redis
-- Docker + docker-compose
-- pytest for tests
+## Quick start (Docker)
 
-## Project structure
-
-- `app/main.py`: app factory, middleware, startup/shutdown lifecycle.
-- `app/routers/recommendations.py`: API routes and request/response schemas.
-- `app/services/algorithm.py`: recommendation scoring logic.
-- `app/services/data_service.py`: SQL query layer for scoring signals.
-- `app/services/cache_service.py`: Redis cache operations.
-- `app/db.py`: SQLAlchemy engine/session setup.
-- `app/models.py`: ORM models.
-- `tests/test_api_smoke.py`: smoke tests for key endpoints.
-
-## API endpoints
-
-- `GET /`: service metadata.
-- `GET /api/recommend/products?seller_id=<id>&limit=<n>`: recommendations.
-- `GET /api/recommend/health`: health endpoint.
-- `POST /api/recommend/cache/clear`: clear cache (admin endpoint).
-  - Protected by `X-API-Key` when `ADMIN_API_KEY` is configured.
-  - In production, this endpoint is disabled unless `ADMIN_API_KEY` is set.
-
-## Quick start
-
-1. Install dependencies:
+This is the recommended local setup (Postgres + Redis + API + Prometheus + Grafana):
 
 ```bash
-pip install -r requirements.txt
+docker compose up -d --build
 ```
 
-2. Create environment file:
+Then open:
+- **API**: `http://localhost:8000`
+- **API docs** (dev only): `http://localhost:8000/docs`
+- **Prometheus**: `http://localhost:9090`
+- **Grafana**: `http://localhost:3001` (default `admin` / `admin`)
+
+## Quick start (Python / local)
 
 ```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements-dev.txt
 cp .env.example .env
-```
-
-3. Start the service:
-
-```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-4. Open docs:
+## Key endpoints
 
-- `http://localhost:8000/docs` (development mode)
+- **Service info**: `GET /`
+- **Recommendations**: `GET /api/recommend/products`
+- **Health**: `GET /api/recommend/health`
+- **Metrics**: `GET /metrics`
+- **Admin cache clear**: `POST /api/recommend/cache/clear` (requires `X-API-Key` if `ADMIN_API_KEY` is set)
 
-## Running tests
+## Tests
 
 ```bash
-pip install -r requirements-dev.txt
 pytest -q
 ```
 
-## Prometheus + Grafana
+## Configuration
 
-This project now exposes Prometheus metrics at `GET /metrics`.
+See `.env.example`. Minimum required in real deployments:
+- **`DATABASE_URL`**
 
-To run app + Redis + Prometheus + Grafana:
-
-```bash
-docker compose up --build
-```
-
-Endpoints:
-- App: `http://localhost:8000`
-- Prometheus: `http://localhost:9090`
-- Grafana: `http://localhost:3001` (`admin` / `admin`)
-
-For full setup and dashboard queries, see `docs/PROJECT_WORKFLOW_NEXTJS_GRAFANA.md`.
-
-## Environment variables
-
-See `.env.example` for all supported settings.
-
-Minimum required:
-
-- `DATABASE_URL`
-
-Strongly recommended for production:
-
-- `ENVIRONMENT=production`
-- `ADMIN_API_KEY=<strong-secret>`
-- `CORS_ORIGINS=[...]`
-- `ALLOWED_HOSTS=[...]`
-
-## Notes
-
-- The service does not include a frontend.
-- Next.js should call this API over HTTP(S), typically via server-side routes/actions.
-- For a full integration walkthrough and a Grafana rollout plan, read `docs/PROJECT_WORKFLOW_NEXTJS_GRAFANA.md`.
+Production recommendations:
+- **`ENVIRONMENT=production`**
+- **`ADMIN_API_KEY=<strong-secret>`**
+- **`CORS_ORIGINS=[...]`**
+- **`ALLOWED_HOSTS=[...]`**
