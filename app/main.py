@@ -16,6 +16,7 @@ from app.routers import recommendations
 from app.config import get_settings, setup_logging
 from app.db import engine, test_connection
 from app.metrics import HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS
+from app.meta import SERVICE_NAME, VERSION
 
 # Configure logging
 setup_logging()
@@ -59,9 +60,9 @@ def create_app() -> FastAPI:
     """Create and configure FastAPI application."""
 
     app = FastAPI(
-        title="Recommendation Service",
+        title=SERVICE_NAME,
         description="Intelligent product recommendations for sellers",
-        version="2.0.0",
+        version=VERSION,
         docs_url="/docs" if settings.is_development else None,
         redoc_url="/redoc" if settings.is_development else None,
         openapi_url="/openapi.json" if settings.is_development else None,
@@ -117,8 +118,8 @@ def create_app() -> FastAPI:
     async def root():
         """Root endpoint — service info."""
         return {
-            "service": "Recommendation Service",
-            "version": "2.0.0",
+            "service": SERVICE_NAME,
+            "version": VERSION,
             "endpoints": {
                 "recommendations": "GET /api/recommend/products?seller_id=X&limit=20",
                 "health": "GET /api/recommend/health",

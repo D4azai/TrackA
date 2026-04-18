@@ -2,7 +2,6 @@
 Maroc Affiliate Recommendation Service
 FastAPI microservice for product recommendations
 """
+from .meta import SERVICE_NAME, VERSION
 
-from .main import app
-
-__all__ = ["app"]
+__all__ = ["SERVICE_NAME", "VERSION"]

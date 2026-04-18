@@ -20,6 +20,7 @@ from app.db import get_db
 from app.services.algorithm import RecommendationEngine
 from app.services.cache_service import CacheService
 from app.config import get_settings
+from app.meta import VERSION
 
 try:
     from app.metrics import RECOMMENDATION_CACHE_TOTAL, RECOMMENDATION_COMPUTE_DURATION_SECONDS
@@ -212,7 +213,7 @@ async def health_check() -> HealthResponse:
     return HealthResponse(
         status="healthy",
         service="recommendation-engine",
-        version="2.1.0",
+        version=VERSION,
         cache=cache_status,
     )
 
