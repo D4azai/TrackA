@@ -4,14 +4,18 @@ Main entry point. Production-ready with security middleware and proper lifecycle
 """
 
 from fastapi import FastAPI
+from fastapi import Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from contextlib import asynccontextmanager
+import time
 import logging
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.routers import recommendations
 from app.config import get_settings, setup_logging
 from app.db import engine, test_connection
+from app.metrics import HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS
 
 # Configure logging
 setup_logging()
@@ -89,6 +93,25 @@ def create_app() -> FastAPI:
         tags=["recommendations"]
     )
 
+    @app.middleware("http")
+    async def metrics_middleware(request: Request, call_next):
+        start = time.perf_counter()
+        path = request.url.path
+        method = request.method
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            elapsed = time.perf_counter() - start
+            HTTP_REQUEST_DURATION_SECONDS.labels(method=method, path=path).observe(elapsed)
+            HTTP_REQUESTS_TOTAL.labels(
+                method=method,
+                path=path,
+                status_code=str(status_code)
+            ).inc()
+
     # Root endpoint
     @app.get("/")
     async def root():
@@ -99,10 +122,15 @@ def create_app() -> FastAPI:
             "endpoints": {
                 "recommendations": "GET /api/recommend/products?seller_id=X&limit=20",
                 "health": "GET /api/recommend/health",
-                "cache_clear": "POST /api/recommend/cache/clear"
+                "cache_clear": "POST /api/recommend/cache/clear",
+                "metrics": "GET /metrics"
             },
             "docs": "/docs" if settings.is_development else "disabled in production"
         }
+
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics():
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     return app
 
