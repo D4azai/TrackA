@@ -1,6 +1,13 @@
 """
 Redis cache service for recommendations.
 Handles caching, TTL, and invalidation with graceful degradation.
+
+Design decisions:
+- No pre-flight PING on every call — overhead removed.
+  Instead, each operation handles its own ConnectionError.
+- Popular products cached separately (shared across all sellers).
+- Graceful degradation: if Redis is unavailable the service
+  continues working — just without caching.
 """
 
 import json
@@ -16,239 +23,191 @@ settings = get_settings()
 
 
 class CacheService:
-    """Redis wrapper for recommendation caching."""
+    """Redis wrapper for recommendation caching with graceful degradation."""
 
-    # Cache key prefixes
     PREFIX_RECOMMENDATIONS = "rec:products:"
-    PREFIX_POPULAR = "rec:popular:"
-    PREFIX_SELLER_PREFS = "rec:prefs:"
-    PREFIX_HEALTH = "rec:health"
+    PREFIX_POPULAR         = "rec:popular:global"
+    PREFIX_SELLER_PREFS    = "rec:prefs:"
 
-    # Default TTL (1 hour)
-    DEFAULT_TTL = 3600
+    DEFAULT_TTL         = 3600   # 1 hour
+    POPULAR_TTL         = 900    # 15 minutes (popular changes faster)
 
     def __init__(self):
-        """Initialize Redis connection."""
+        self._client: Optional[redis.Redis] = None
+        self._connect()
+
+    def _connect(self) -> None:
+        """Attempt to connect to Redis. Failures are non-fatal."""
         try:
-            self.redis = redis.from_url(
+            self._client = redis.from_url(
                 settings.redis_url,
                 decode_responses=True,
-                socket_connect_timeout=5,
-                socket_keepalive=True
+                socket_connect_timeout=3,
+                socket_timeout=3,
+                socket_keepalive=True,
+                retry_on_timeout=True,
             )
-            # Test connection
-            self.redis.ping()
+            self._client.ping()
             logger.info("Redis connection established")
         except Exception as e:
-            logger.error(f"Failed to connect to Redis: {str(e)}")
-            self.redis = None
+            logger.warning(f"Redis unavailable — caching disabled: {e}")
+            self._client = None
 
-    def is_available(self) -> bool:
-        """Check if Redis is available."""
-        if not self.redis:
-            return False
-        try:
-            self.redis.ping()
-            return True
-        except Exception as e:
-            logger.warning(f"Redis health check failed: {str(e)}")
-            return False
+    def _get_client(self) -> Optional[redis.Redis]:
+        """
+        Return the Redis client, attempting reconnect if previously failed.
+        Returns None if Redis is unavailable.
+        """
+        if self._client is not None:
+            return self._client
+        # Try reconnect (e.g. Redis restarted after service startup)
+        self._connect()
+        return self._client
 
     # ==================== RECOMMENDATIONS ====================
 
-    def get_recommendations(
-            self,
-            seller_id: str
-    ) -> Optional[List[Dict[str, Any]]]:
-        """
-        Get cached recommendations for seller.
-
-        Args:
-            seller_id: The seller ID
-
-        Returns:
-            Cached recommendations or None if not found/expired
-        """
-        if not self.is_available():
+    def get_recommendations(self, seller_id: str) -> Optional[List[Dict[str, Any]]]:
+        """Get cached recommendations for a seller. Returns None on miss or error."""
+        client = self._get_client()
+        if not client:
             return None
-
         try:
             key = f"{self.PREFIX_RECOMMENDATIONS}{seller_id}"
-            cached = self.redis.get(key)
-
-            if cached:
-                logger.info(f"Cache hit for seller {seller_id}")
-                return json.loads(cached)
-
-            logger.info(f"Cache miss for seller {seller_id}")
+            data = client.get(key)
+            if data:
+                logger.debug(f"Cache HIT for seller {seller_id}")
+                return json.loads(data)
+            logger.debug(f"Cache MISS for seller {seller_id}")
             return None
-
-        except Exception as e:
-            logger.error(f"Error reading recommendations cache: {str(e)}")
+        except redis.RedisError as e:
+            logger.warning(f"Redis read error (recommendations): {e}")
+            self._client = None   # force reconnect on next call
             return None
 
     def set_recommendations(
-            self,
-            seller_id: str,
-            recommendations: List[Dict[str, Any]],
-            ttl: int = None
+        self,
+        seller_id: str,
+        recommendations: List[Dict[str, Any]],
+        ttl: int = None,
     ) -> bool:
-        """
-        Cache recommendations for seller.
-
-        Args:
-            seller_id: The seller ID
-            recommendations: List of recommendations to cache
-            ttl: Time-to-live in seconds (default 1 hour)
-
-        Returns:
-            True if cached successfully
-        """
-        if not self.is_available():
+        """Cache recommendations for a seller. Returns True on success."""
+        client = self._get_client()
+        if not client:
             return False
-
         try:
             key = f"{self.PREFIX_RECOMMENDATIONS}{seller_id}"
-            ttl = ttl or self.DEFAULT_TTL
-
-            self.redis.setex(
-                key,
-                ttl,
-                json.dumps(recommendations)
-            )
-            logger.info(f"Cached recommendations for seller {seller_id}, TTL={ttl}s")
+            client.setex(key, ttl or self.DEFAULT_TTL, json.dumps(recommendations))
+            logger.debug(f"Cached {len(recommendations)} recs for seller {seller_id}, TTL={ttl or self.DEFAULT_TTL}s")
             return True
+        except redis.RedisError as e:
+            logger.warning(f"Redis write error (recommendations): {e}")
+            self._client = None
+            return False
 
-        except Exception as e:
-            logger.error(f"Error caching recommendations: {str(e)}")
+    # ==================== POPULAR PRODUCTS ====================
+
+    def get_popular(self) -> Optional[List[Dict[str, Any]]]:
+        """Get globally cached popular-products list. Returns None on miss."""
+        client = self._get_client()
+        if not client:
+            return None
+        try:
+            data = client.get(self.PREFIX_POPULAR)
+            if data:
+                logger.debug("Cache HIT for popular products")
+                return json.loads(data)
+            return None
+        except redis.RedisError as e:
+            logger.warning(f"Redis read error (popular): {e}")
+            self._client = None
+            return None
+
+    def set_popular(self, popular: List[Dict[str, Any]]) -> bool:
+        """Cache the global popular-products list (15-min TTL)."""
+        client = self._get_client()
+        if not client:
+            return False
+        try:
+            client.setex(self.PREFIX_POPULAR, self.POPULAR_TTL, json.dumps(popular))
+            logger.debug(f"Cached {len(popular)} popular products, TTL={self.POPULAR_TTL}s")
+            return True
+        except redis.RedisError as e:
+            logger.warning(f"Redis write error (popular): {e}")
+            self._client = None
             return False
 
     # ==================== INVALIDATION ====================
 
     def delete(self, seller_id: str) -> bool:
-        """
-        Delete cached recommendations for a specific seller.
-
-        Args:
-            seller_id: The seller ID
-
-        Returns:
-            True if deleted
-        """
-        if not self.is_available():
+        """Delete cached recommendations for a specific seller."""
+        client = self._get_client()
+        if not client:
             return False
-
         try:
-            keys_to_delete = [
+            keys = [
                 f"{self.PREFIX_RECOMMENDATIONS}{seller_id}",
-                f"{self.PREFIX_SELLER_PREFS}{seller_id}"
+                f"{self.PREFIX_SELLER_PREFS}{seller_id}",
             ]
-            if self.redis.delete(*keys_to_delete) > 0:
-                logger.info(f"Invalidated cache for seller {seller_id}")
+            deleted = client.delete(*keys)
+            if deleted:
+                logger.info(f"Invalidated cache for seller {seller_id} ({deleted} keys)")
             return True
-
-        except Exception as e:
-            logger.error(f"Error invalidating cache: {str(e)}")
+        except redis.RedisError as e:
+            logger.warning(f"Redis delete error: {e}")
+            self._client = None
             return False
 
+    # Alias
     def invalidate_seller(self, seller_id: str) -> bool:
-        """Alias for delete(). Invalidate all cache for a seller."""
         return self.delete(seller_id)
-
-    def invalidate_product(self, product_id: int) -> bool:
-        """
-        Invalidate popular products cache (when product is ordered).
-
-        Args:
-            product_id: The product ID
-
-        Returns:
-            True if invalidated
-        """
-        if not self.is_available():
-            return False
-
-        try:
-            key = f"{self.PREFIX_POPULAR}global"
-            self.redis.delete(key)
-            logger.info(f"Invalidated popular products cache due to product {product_id}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Error invalidating product cache: {str(e)}")
-            return False
 
     def clear_all(self) -> bool:
         """
-        Invalidate all recommendation caches.
-        Use sparingly — only on major data changes.
-
-        Uses SCAN instead of KEYS to avoid blocking Redis.
-
-        Returns:
-            True if invalidated
+        Invalidate ALL recommendation caches.
+        Uses SCAN (cursor-based) to avoid blocking Redis in production.
         """
-        if not self.is_available():
+        client = self._get_client()
+        if not client:
             return False
-
         try:
             pattern = "rec:*"
             deleted_count = 0
             cursor = 0
-
-            # Use SCAN instead of KEYS to avoid blocking Redis
             while True:
-                cursor, keys = self.redis.scan(cursor=cursor, match=pattern, count=100)
+                cursor, keys = client.scan(cursor=cursor, match=pattern, count=100)
                 if keys:
-                    self.redis.delete(*keys)
+                    client.delete(*keys)
                     deleted_count += len(keys)
                 if cursor == 0:
                     break
-
-            if deleted_count > 0:
-                logger.warning(f"Invalidated all {deleted_count} recommendation caches")
-
+            logger.warning(f"Cleared all {deleted_count} recommendation cache keys")
             return True
-
-        except Exception as e:
-            logger.error(f"Error invalidating all caches: {str(e)}")
+        except redis.RedisError as e:
+            logger.warning(f"Redis clear_all error: {e}")
+            self._client = None
             return False
 
+    # Alias
     def invalidate_all(self) -> bool:
-        """Alias for clear_all()."""
         return self.clear_all()
 
     # ==================== HEALTH ====================
 
-    def set_health_status(self, status: str) -> bool:
-        """
-        Store last health check status.
-
-        Args:
-            status: "healthy" or "unhealthy"
-
-        Returns:
-            True if set
-        """
-        if not self.is_available():
+    def is_healthy(self) -> bool:
+        """Lightweight health check — PING Redis."""
+        client = self._get_client()
+        if not client:
             return False
-
         try:
-            self.redis.setex(
-                self.PREFIX_HEALTH,
-                300,  # 5 minutes
-                status
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Error setting health status: {str(e)}")
+            return client.ping()
+        except Exception:
             return False
 
-    def close(self):
-        """Close Redis connection."""
-        if self.redis:
+    def close(self) -> None:
+        """Close Redis connection gracefully."""
+        if self._client:
             try:
-                self.redis.close()
+                self._client.close()
                 logger.info("Redis connection closed")
             except Exception as e:
-                logger.error(f"Error closing Redis: {str(e)}")
+                logger.warning(f"Error closing Redis: {e}")
