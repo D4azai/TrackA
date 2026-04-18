@@ -3,7 +3,7 @@
 FastAPI microservice that returns **personalized product recommendations** for sellers.
 
 - **API**: `GET /api/recommend/products?seller_id=<id>&limit=<n>`
-- **Caching**: Redis (graceful деградация if Redis is down)
+- **Caching**: Redis (graceful degradation if Redis is down)
 - **Observability**: Prometheus metrics at `GET /metrics` + optional Grafana dashboard
 
 ## Documentation (A → Z)
