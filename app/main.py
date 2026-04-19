@@ -44,6 +44,12 @@ async def lifespan(app: FastAPI):
     logger.info(f"Environment: {settings.environment}")
     logger.info(f"Algorithm weights: {settings.algorithm_weights}")
     logger.info(f"Cache enabled: {settings.cache_enabled}, TTL: {settings.cache_ttl_seconds}s")
+    logger.info(
+        "Precomputed freshness: %ss, sync fallback: %s, store limit: %s",
+        settings.precomputed_freshness_seconds,
+        settings.allow_sync_recompute_fallback,
+        settings.precomputed_store_limit,
+    )
 
     yield
 
@@ -124,6 +130,8 @@ def create_app() -> FastAPI:
                 "recommendations": "GET /api/recommend/products?seller_id=X&limit=20",
                 "health": "GET /api/recommend/health",
                 "cache_clear": "POST /api/recommend/cache/clear",
+                "refresh_seller": "POST /api/recommend/refresh/seller",
+                "refresh_jobs_run": "POST /api/recommend/jobs/run",
                 "metrics": "GET /metrics"
             },
             "docs": "/docs" if settings.is_development else "disabled in production"

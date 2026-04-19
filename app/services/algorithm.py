@@ -20,7 +20,7 @@ Response time target: <300ms (first load), <5ms (cache hit)
 
 import logging
 import time
-from typing import List, Dict, Optional
+from typing import Dict, List
 
 from sqlalchemy.orm import Session
 
@@ -93,9 +93,7 @@ class RecommendationEngine:
             item["product_id"]: item["score"] for item in popular
         }
 
-        candidate_ids: List[int] = list(
-            {item["product_id"] for item in popular} | set(history.keys())
-        )
+        candidate_ids = self._build_candidate_ids(popular, history, limit)
 
         # Catalog fallback — pad pool when popularity + history are thin
         needed = (limit * 2) - len(candidate_ids)
@@ -172,7 +170,7 @@ class RecommendationEngine:
             if final_score < self.settings.min_score_threshold:
                 continue
 
-            is_personalized = exact_history > 0 or recency_score > 0
+            is_personalized = exact_history > 0 or recency_score > 0 or cat_affinity > 0
 
             scored.append({
                 "product_id":      product_id,
@@ -190,7 +188,7 @@ class RecommendationEngine:
         # ======================================================
         # STEP 4: RANK AND RETURN TOP N
         # ======================================================
-        scored.sort(key=lambda x: x["score"], reverse=True)
+        scored.sort(key=lambda x: (-x["score"], x["product_id"]))
         recommendations = scored[:limit]
 
         for i, rec in enumerate(recommendations, 1):
@@ -213,3 +211,31 @@ class RecommendationEngine:
         )
 
         return recommendations
+
+    @staticmethod
+    def _build_candidate_ids(
+        popular: List[Dict],
+        history: Dict[int, Dict],
+        limit: int,
+    ) -> List[int]:
+        """
+        Build a deterministic candidate pool.
+
+        Popular products keep their DB ranking first, then seller-history-only
+        products are appended in query order. This keeps ties stable for clients.
+        """
+        candidate_ids: List[int] = []
+        seen: set[int] = set()
+
+        for item in popular:
+            product_id = item["product_id"]
+            if product_id not in seen:
+                candidate_ids.append(product_id)
+                seen.add(product_id)
+
+        for product_id in history.keys():
+            if product_id not in seen:
+                candidate_ids.append(product_id)
+                seen.add(product_id)
+
+        return candidate_ids[: limit * 2]

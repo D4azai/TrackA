@@ -31,3 +31,27 @@ RECOMMENDATION_CACHE_TOTAL = Counter(
     ["result"],
 )
 
+RECOMMENDATION_RESPONSE_SOURCE_TOTAL = Counter(
+    "recommendation_response_source_total",
+    "Source used to serve recommendation responses.",
+    ["source"],
+)
+
+RECOMMENDATION_PRECOMPUTED_TOTAL = Counter(
+    "recommendation_precomputed_total",
+    "Precomputed recommendation snapshot outcomes.",
+    ["result"],
+)
+
+RECOMMENDATION_REFRESH_JOBS_TOTAL = Counter(
+    "recommendation_refresh_jobs_total",
+    "Recommendation refresh job lifecycle events.",
+    ["trigger", "status"],
+)
+
+RECOMMENDATION_REFRESH_DURATION_SECONDS = Histogram(
+    "recommendation_refresh_duration_seconds",
+    "Background recommendation refresh duration in seconds.",
+    ["trigger", "status"],
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30),
+)

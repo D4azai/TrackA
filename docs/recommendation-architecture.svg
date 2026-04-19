@@ -1,0 +1,149 @@
+<svg width="1600" height="980" viewBox="0 0 1600 980" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="160" y1="80" x2="1440" y2="900" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF3E2"/>
+      <stop offset="1" stop-color="#EEF4F7"/>
+    </linearGradient>
+    <linearGradient id="platform" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#FFE4C2"/>
+      <stop offset="1" stop-color="#FFD4A2"/>
+    </linearGradient>
+    <linearGradient id="service" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#D8F0FF"/>
+      <stop offset="1" stop-color="#B9E1FA"/>
+    </linearGradient>
+    <linearGradient id="data" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#E8F8DE"/>
+      <stop offset="1" stop-color="#CDEEBE"/>
+    </linearGradient>
+    <linearGradient id="ops" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#F2E5FF"/>
+      <stop offset="1" stop-color="#E1CCFA"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#23313F" flood-opacity="0.14"/>
+    </filter>
+    <marker id="arrow" markerWidth="14" markerHeight="14" refX="10" refY="7" orient="auto">
+      <path d="M1 1L11 7L1 13" stroke="#44515C" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <style>
+      .title { font: 700 34px "Segoe UI", Arial, sans-serif; fill: #17212B; }
+      .subtitle { font: 500 18px "Segoe UI", Arial, sans-serif; fill: #55616C; }
+      .section { font: 700 15px "Segoe UI", Arial, sans-serif; letter-spacing: 0.08em; fill: #56626D; }
+      .card-title { font: 700 24px "Segoe UI", Arial, sans-serif; fill: #17212B; }
+      .card-text { font: 500 18px "Segoe UI", Arial, sans-serif; fill: #33414D; }
+      .small { font: 500 16px "Segoe UI", Arial, sans-serif; fill: #4F5D69; }
+      .mono { font: 600 16px "Courier New", monospace; fill: #1E2A35; }
+      .label { font: 700 16px "Segoe UI", Arial, sans-serif; fill: #27333E; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="980" rx="36" fill="url(#bg)"/>
+  <text x="100" y="88" class="title">Recommendation Architecture</text>
+  <text x="100" y="120" class="subtitle">Main platform calls FastAPI, FastAPI computes rankings, PostgreSQL provides source signals, Redis caches results.</text>
+
+  <text x="120" y="190" class="section">CLIENT PLATFORM</text>
+  <g filter="url(#shadow)">
+    <rect x="100" y="210" width="330" height="220" rx="28" fill="url(#platform)" stroke="#D9B07B" stroke-width="2"/>
+  </g>
+  <text x="130" y="266" class="card-title">Next.js Main Platform</text>
+  <text x="130" y="304" class="card-text">Seller dashboard inventory page</text>
+  <text x="130" y="336" class="card-text">Thin HTTP client only</text>
+  <text x="130" y="378" class="mono">GET /api/recommend/products</text>
+  <text x="130" y="408" class="mono">?seller_id=&lt;id&gt;&amp;limit=&lt;n&gt;</text>
+
+  <text x="565" y="190" class="section">RECOMMENDATION SERVICE</text>
+  <g filter="url(#shadow)">
+    <rect x="520" y="210" width="560" height="520" rx="32" fill="url(#service)" stroke="#8BBFDF" stroke-width="2"/>
+  </g>
+  <text x="550" y="266" class="card-title">FastAPI Recommendation Service</text>
+  <text x="550" y="306" class="card-text">Single source of truth for recommendation logic</text>
+
+  <g>
+    <rect x="550" y="340" width="220" height="110" rx="22" fill="#F7FCFF" stroke="#A9D0EA" stroke-width="2"/>
+    <text x="574" y="382" class="label">1. Router Layer</text>
+    <text x="574" y="412" class="small">Validates seller_id and limit</text>
+    <text x="574" y="438" class="small">Formats stable API response</text>
+  </g>
+
+  <g>
+    <rect x="810" y="340" width="230" height="110" rx="22" fill="#F7FCFF" stroke="#A9D0EA" stroke-width="2"/>
+    <text x="834" y="382" class="label">2. Cache Check</text>
+    <text x="834" y="412" class="small">Redis key lookup per seller</text>
+    <text x="834" y="438" class="mono">rec:products:&lt;seller_id&gt;</text>
+  </g>
+
+  <g>
+    <rect x="550" y="490" width="220" height="190" rx="22" fill="#F7FCFF" stroke="#A9D0EA" stroke-width="2"/>
+    <text x="574" y="530" class="label">3. Recommendation Engine</text>
+    <text x="574" y="562" class="small">Candidate generation:</text>
+    <text x="592" y="590" class="small">popular products</text>
+    <text x="592" y="616" class="small">seller history</text>
+    <text x="592" y="642" class="small">catalog fallback</text>
+  </g>
+
+  <g>
+    <rect x="810" y="490" width="230" height="190" rx="22" fill="#F7FCFF" stroke="#A9D0EA" stroke-width="2"/>
+    <text x="834" y="530" class="label">4. Scoring Signals</text>
+    <text x="834" y="562" class="small">popularity</text>
+    <text x="834" y="588" class="small">history and category affinity</text>
+    <text x="834" y="614" class="small">recency</text>
+    <text x="834" y="640" class="small">newness</text>
+    <text x="834" y="666" class="small">engagement</text>
+  </g>
+
+  <text x="1170" y="190" class="section">DATA AND OPERATIONS</text>
+  <g filter="url(#shadow)">
+    <rect x="1140" y="210" width="330" height="200" rx="28" fill="url(#data)" stroke="#A2C98D" stroke-width="2"/>
+  </g>
+  <text x="1170" y="266" class="card-title">PostgreSQL</text>
+  <text x="1170" y="306" class="card-text">Source data for recommendations</text>
+  <text x="1170" y="342" class="small">Orders, OrderItems, Products,</text>
+  <text x="1170" y="368" class="small">ProductReaction, ProductComment, Category</text>
+
+  <g filter="url(#shadow)">
+    <rect x="1140" y="450" width="330" height="150" rx="28" fill="url(#data)" stroke="#A2C98D" stroke-width="2"/>
+  </g>
+  <text x="1170" y="506" class="card-title">Redis Cache</text>
+  <text x="1170" y="546" class="small">Stores computed recommendation lists</text>
+  <text x="1170" y="576" class="mono">TTL = CACHE_TTL_SECONDS</text>
+
+  <g filter="url(#shadow)">
+    <rect x="1140" y="640" width="330" height="180" rx="28" fill="url(#ops)" stroke="#C7B2E8" stroke-width="2"/>
+  </g>
+  <text x="1170" y="696" class="card-title">Observability</text>
+  <text x="1170" y="736" class="small">Prometheus scrapes /metrics</text>
+  <text x="1170" y="764" class="small">Grafana visualizes latency, cache hit rate,</text>
+  <text x="1170" y="790" class="small">and recommendation compute timings</text>
+
+  <path d="M430 320H500" stroke="#44515C" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="434" y="302" class="small">HTTP request</text>
+
+  <path d="M430 378H500" stroke="#44515C" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="434" y="410" class="small">JSON response</text>
+
+  <path d="M770 395H800" stroke="#44515C" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M925 450V476" stroke="#44515C" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M770 585H800" stroke="#44515C" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <path d="M1040 390H1120" stroke="#44515C" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="1048" y="370" class="small">SQLAlchemy queries</text>
+
+  <path d="M1040 560H1120" stroke="#44515C" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="1048" y="540" class="small">cache read/write</text>
+
+  <path d="M1080 310C1140 310 1140 310 1140 310" stroke="#44515C" stroke-width="0"/>
+  <path d="M800 760C800 860 1290 860 1290 828" stroke="#44515C" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="838" y="886" class="small">/metrics exposes HTTP and recommendation metrics</text>
+
+  <g>
+    <rect x="100" y="500" width="970" height="340" rx="28" fill="#FFFFFFAA" stroke="#D8E1E7" stroke-width="2"/>
+    <text x="130" y="548" class="card-title">Request Sequence</text>
+    <text x="130" y="592" class="card-text">1. Next.js calls FastAPI with seller_id and limit.</text>
+    <text x="130" y="628" class="card-text">2. FastAPI checks Redis for cached recommendations for that seller.</text>
+    <text x="130" y="664" class="card-text">3. On cache miss, the engine fetches source signals from PostgreSQL in batch.</text>
+    <text x="130" y="700" class="card-text">4. The engine scores and ranks products inside FastAPI.</text>
+    <text x="130" y="736" class="card-text">5. FastAPI stores the computed list in Redis and returns JSON to Next.js.</text>
+    <text x="130" y="772" class="card-text">6. Prometheus and Grafana observe the service, but do not influence ranking.</text>
+  </g>
+</svg>

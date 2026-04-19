@@ -576,3 +576,47 @@ class DataService:
         except Exception as e:
             logger.error(f"Error getting product details: {str(e)}")
             return {}
+
+    # ==================== REFRESH TARGETING ====================
+
+    def get_active_seller_ids(
+        self,
+        days: int = 30,
+        limit: int = 500,
+    ) -> List[str]:
+        """
+        Get recently active sellers for scheduled or catalog-wide refreshes.
+
+        Activity is based on recent completed/confirmed order volume.
+        """
+        try:
+            cutoff_date = datetime.utcnow() - timedelta(days=days)
+
+            results = (
+                self.db.query(
+                    Order.sellerId,
+                    func.count(Order.id).label("order_count"),
+                    func.max(Order.createdAt).label("last_order_at"),
+                )
+                .filter(
+                    and_(
+                        Order.createdAt >= cutoff_date,
+                        Order.status.in_(["CONFIRMED", "COMPLETED", "IN_DELIVERY", "PROCESSING"]),
+                    )
+                )
+                .group_by(Order.sellerId)
+                .order_by(
+                    desc(func.count(Order.id)),
+                    desc(func.max(Order.createdAt)),
+                )
+                .limit(limit)
+                .all()
+            )
+
+            seller_ids = [row.sellerId for row in results if row.sellerId]
+            logger.info(f"Found {len(seller_ids)} active sellers for refresh targeting")
+            return seller_ids
+
+        except Exception as e:
+            logger.error(f"Error getting active seller ids: {str(e)}")
+            return []

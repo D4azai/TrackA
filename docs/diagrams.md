@@ -1,5 +1,10 @@
 # Diagrams (Mermaid)
 
+## Architecture image
+
+Standalone SVG image:
+- [recommendation-architecture.svg](/home/aymane/TrackA-1/docs/recommendation-architecture.svg)
+
 ## Component diagram
 
 ```mermaid
@@ -73,4 +78,3 @@ classDiagram
   RecommendationEngine --> DataService : uses
   RecommendationEngine ..> CacheService : called by API layer
 ```
-

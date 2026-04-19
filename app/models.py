@@ -3,7 +3,20 @@ SQLAlchemy models matching Prisma schema.
 Only includes models needed for the recommendation service.
 """
 
-from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, ForeignKey, Text, JSON, func
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
@@ -116,3 +129,52 @@ class Category(Base):
 
     # Relationships
     products = relationship("Product", back_populates="category")
+
+
+class SellerRecommendation(Base):
+    """Durable precomputed recommendations for a seller."""
+    __tablename__ = "SellerRecommendation"
+
+    id = Column(Integer, primary_key=True)
+    sellerId = Column(String, nullable=False)
+    productId = Column(Integer, ForeignKey("Product.id"), nullable=False)
+    score = Column(Float, nullable=False)
+    rank = Column(Integer, nullable=False)
+    isPersonalized = Column(Boolean, nullable=False, default=False)
+    sources = Column(JSON, nullable=False, default=dict)
+    computedAt = Column(DateTime, nullable=False)
+    algorithmVersion = Column(String, nullable=False)
+    createdAt = Column(DateTime, server_default=func.now())
+    updatedAt = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    product = relationship("Product")
+
+    __table_args__ = (
+        Index("ix_sellerrecommendation_seller_rank", "sellerId", "rank"),
+        UniqueConstraint("sellerId", "productId", name="uq_sellerrecommendation_seller_product"),
+    )
+
+
+class RecommendationRefreshJob(Base):
+    """Durable refresh job queue for background recommendation recomputation."""
+    __tablename__ = "RecommendationRefreshJob"
+
+    id = Column(Integer, primary_key=True)
+    sellerId = Column(String, nullable=False)
+    trigger = Column(String, nullable=False, default="manual")
+    status = Column(String, nullable=False, default="PENDING")
+    priority = Column(Integer, nullable=False, default=100)
+    requestedBy = Column(String, nullable=True)
+    details = Column(JSON, nullable=False, default=dict)
+    resultCount = Column(Integer, nullable=False, default=0)
+    attemptCount = Column(Integer, nullable=False, default=0)
+    algorithmVersion = Column(String, nullable=True)
+    requestedAt = Column(DateTime, server_default=func.now(), nullable=False)
+    startedAt = Column(DateTime, nullable=True)
+    completedAt = Column(DateTime, nullable=True)
+    lastError = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_recommendationrefreshjob_status_requested", "status", "requestedAt"),
+        Index("ix_recommendationrefreshjob_seller_requested", "sellerId", "requestedAt"),
+    )

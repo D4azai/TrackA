@@ -13,6 +13,8 @@ from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
+from app.meta import ALGORITHM_VERSION
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,6 +65,55 @@ class Settings(BaseSettings):
 
     max_limit: int = Field(default=100, ge=1, description="Maximum recommendations per request")
     min_score_threshold: float = Field(default=0.0, description="Minimum score to include in results")
+    recommendation_algorithm_version: str = Field(
+        default=ALGORITHM_VERSION,
+        description="Version tag stored with precomputed recommendation snapshots",
+    )
+
+    # ============= PRECOMPUTED STORAGE & REFRESH =============
+    precomputed_store_limit: int = Field(
+        default=100,
+        ge=1,
+        description="How many recommendations to store durably per seller snapshot",
+    )
+    precomputed_freshness_seconds: int = Field(
+        default=1800,
+        ge=1,
+        description="Maximum age before a precomputed recommendation snapshot is considered stale",
+    )
+    serve_stale_precomputed: bool = Field(
+        default=True,
+        description="Serve stale Postgres snapshots while a background refresh is queued",
+    )
+    sync_recompute_fallback_enabled: Optional[bool] = Field(
+        default=None,
+        description="Force synchronous recomputation fallback. If unset, defaults to development only.",
+    )
+    refresh_active_sellers_lookback_days: int = Field(
+        default=30,
+        ge=1,
+        description="Lookback window used to define active sellers for scheduled refreshes",
+    )
+    refresh_active_sellers_limit: int = Field(
+        default=500,
+        ge=1,
+        description="Maximum active sellers enqueued by scheduled or catalog-wide refresh triggers",
+    )
+    refresh_event_priority: int = Field(
+        default=150,
+        ge=1,
+        description="Priority assigned to event-driven refresh jobs",
+    )
+    refresh_schedule_priority: int = Field(
+        default=100,
+        ge=1,
+        description="Priority assigned to scheduled refresh jobs",
+    )
+    refresh_manual_priority: int = Field(
+        default=200,
+        ge=1,
+        description="Priority assigned to manual admin refresh jobs",
+    )
 
     # ============= LOGGING =============
     log_level: str = Field(default="INFO")
@@ -105,6 +156,20 @@ class Settings(BaseSettings):
     def is_development(self) -> bool:
         """Check if development environment."""
         return self.environment.lower() == "development"
+
+    @property
+    def allow_sync_recompute_fallback(self) -> bool:
+        """Development keeps an inline fallback; production should rely on the worker path."""
+        if self.sync_recompute_fallback_enabled is not None:
+            return self.sync_recompute_fallback_enabled
+        return self.is_development
+
+    @property
+    def recommendation_cache_ttl_seconds(self) -> int:
+        """
+        Hot-cache TTL should never outlive the freshness policy for durable snapshots.
+        """
+        return min(self.cache_ttl_seconds, self.precomputed_freshness_seconds)
 
 
 @lru_cache(maxsize=1)
