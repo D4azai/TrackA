@@ -5,12 +5,13 @@ WORKDIR /app
 # Create an unprivileged user for runtime
 RUN useradd -r -u 10001 -g root appuser
 
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies (app + worker)
+COPY requirements.txt requirements-worker.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-worker.txt
 
-# Copy application code
+# Copy application and worker packages
 COPY app ./app
+COPY worker ./worker
 
 ENV PYTHONUNBUFFERED=1
 

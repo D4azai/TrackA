@@ -20,12 +20,14 @@ Response time target: <300ms (first load), <5ms (cache hit)
 
 import logging
 import time
+import random
 from typing import Dict, List
 
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.services.data_service import DataService
+from app.services.ml_service import MLWeightOptimizer
 
 try:
     from app.metrics import RECOMMENDATION_COMPUTE_DURATION_SECONDS
@@ -57,6 +59,7 @@ class RecommendationEngine:
         self.db = db_session
         self.data_service = DataService(db_session)
         self.settings = settings
+        self.ml_optimizer = MLWeightOptimizer()
 
     def compute_recommendations(
         self,
@@ -126,13 +129,8 @@ class RecommendationEngine:
         newness_data     = self.data_service.get_newness_scores_batch(candidate_ids)
         affinity_data    = self.data_service.get_category_affinity_scores(seller_id, candidate_ids)
 
-        weights = {
-            "popularity": self.settings.weight_popularity,
-            "history":    self.settings.weight_history,
-            "recency":    self.settings.weight_recency,
-            "newness":    self.settings.weight_newness,
-            "engagement": self.settings.weight_engagement,
-        }
+        # Get dynamic ML weights based on seller history size
+        weights = self.ml_optimizer.get_weights_for_seller(seller_history_size=len(history))
 
         # ======================================================
         # STEP 3: SCORE EACH CANDIDATE
@@ -186,10 +184,49 @@ class RecommendationEngine:
             })
 
         # ======================================================
-        # STEP 4: RANK AND RETURN TOP N
+        # STEP 4: RANK AND RETURN TOP N WITH DIVERSITY
         # ======================================================
         scored.sort(key=lambda x: (-x["score"], x["product_id"]))
-        recommendations = scored[:limit]
+        product_details = self.data_service.get_product_details([s["product_id"] for s in scored])
+        
+        final_recommendations = []
+        category_counts = {}
+        exploration_count = int(limit * self.settings.random_exploration_ratio)
+        main_limit = limit - exploration_count
+        
+        rejected = []
+        
+        for item in scored:
+            if len(final_recommendations) >= main_limit:
+                rejected.append(item)
+                continue
+                
+            cat_id = product_details.get(item["product_id"], {}).get("category_id")
+            if cat_id is not None:
+                if category_counts.get(cat_id, 0) >= self.settings.max_per_category:
+                    # Diversity penalty: skip it and put in rejected
+                    rejected.append(item)
+                    continue
+                category_counts[cat_id] = category_counts.get(cat_id, 0) + 1
+                
+            final_recommendations.append(item)
+            
+        # If we couldn't find enough diverse items, backfill with rejected
+        if len(final_recommendations) < main_limit:
+            needed = main_limit - len(final_recommendations)
+            final_recommendations.extend(rejected[:needed])
+            rejected = rejected[needed:]
+            
+        # Random exploration mix-in
+        if exploration_count > 0 and rejected:
+            exploration_items = random.sample(rejected, min(exploration_count, len(rejected)))
+            for item in exploration_items:
+                item["score"] = round(item["score"] * 1.5, 2)  # Boost to ensure visibility
+                item["is_personalized"] = False # Exploration items are considered non-personalized
+            final_recommendations.extend(exploration_items)
+            
+        final_recommendations.sort(key=lambda x: (-x["score"], x["product_id"]))
+        recommendations = final_recommendations[:limit]
 
         for i, rec in enumerate(recommendations, 1):
             rec["rank"] = i

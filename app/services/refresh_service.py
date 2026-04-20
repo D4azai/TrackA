@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from datetime import datetime
 import logging
 import time
+import json
 from typing import Dict, Iterable, List, Optional
+
+try:
+    from kafka import KafkaProducer
+except ImportError:
+    KafkaProducer = None
 
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
@@ -30,6 +36,24 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+# Jobs that fail fewer than this many times are re-queued instead of
+# permanently marked FAILED. Override with REFRESH_MAX_ATTEMPTS in .env.
+_MAX_ATTEMPTS: int = settings.refresh_max_attempts
+
+_kafka_producer = None
+
+def get_kafka_producer():
+    global _kafka_producer
+    if _kafka_producer is None and KafkaProducer is not None:
+        try:
+            _kafka_producer = KafkaProducer(
+                bootstrap_servers=settings.kafka_bootstrap_servers,
+                value_serializer=lambda v: json.dumps(v).encode('utf-8')
+            )
+        except Exception as e:
+            logger.error(f"Failed to connect to Kafka: {e}")
+    return _kafka_producer
 
 
 @dataclass
@@ -75,41 +99,31 @@ class RecommendationRefreshService:
         priority: Optional[int] = None,
         details: Optional[Dict] = None,
     ) -> RefreshEnqueueResult:
-        """Create a durable job unless one is already queued or running for the seller."""
-        existing = (
-            self.db.query(RecommendationRefreshJob)
-            .filter(
-                RecommendationRefreshJob.sellerId == seller_id,
-                RecommendationRefreshJob.status.in_([self.PENDING, self.IN_PROGRESS]),
+        """Publish a refresh event to Kafka."""
+        producer = get_kafka_producer()
+        if producer:
+            payload = {
+                "seller_id": seller_id,
+                "trigger": trigger,
+                "requested_by": requested_by,
+                "priority": priority or self._priority_for_trigger(trigger),
+                "details": details or {}
+            }
+            producer.send(self.settings.kafka_refresh_topic, payload)
+            producer.flush()
+
+            if _metrics_available:
+                RECOMMENDATION_REFRESH_JOBS_TOTAL.labels(trigger=trigger, status="queued").inc()
+
+            logger.info(
+                "Published recommendation refresh event to Kafka for seller %r (trigger=%s)",
+                seller_id,
+                trigger,
             )
-            .order_by(RecommendationRefreshJob.requestedAt.desc())
-            .first()
-        )
-        if existing:
-            return RefreshEnqueueResult(job_id=existing.id, created=False, status=existing.status)
+            return RefreshEnqueueResult(job_id=None, created=True, status="KAFKA_PUBLISHED")
 
-        job = RecommendationRefreshJob(
-            sellerId=seller_id,
-            trigger=trigger,
-            status=self.PENDING,
-            priority=priority or self._priority_for_trigger(trigger),
-            requestedBy=requested_by,
-            details=details or {},
-        )
-        self.db.add(job)
-        self.db.commit()
-        self.db.refresh(job)
-
-        if _metrics_available:
-            RECOMMENDATION_REFRESH_JOBS_TOTAL.labels(trigger=trigger, status="queued").inc()
-
-        logger.info(
-            "Queued recommendation refresh job %s for seller %r (trigger=%s)",
-            job.id,
-            seller_id,
-            trigger,
-        )
-        return RefreshEnqueueResult(job_id=job.id, created=True, status=job.status)
+        logger.error("Failed to publish to Kafka (producer not available)")
+        return RefreshEnqueueResult(job_id=None, created=False, status="KAFKA_ERROR")
 
     def enqueue_many_sellers(
         self,
@@ -119,50 +133,37 @@ class RecommendationRefreshService:
         priority: Optional[int] = None,
         details: Optional[Dict] = None,
     ) -> Dict[str, int]:
-        """Queue refresh jobs for many sellers with de-duplication."""
+        """Publish refresh events for many sellers to Kafka."""
         unique_seller_ids = list(dict.fromkeys(seller_ids))
         if not unique_seller_ids:
             return {"queued": 0, "already_queued": 0}
 
-        existing_jobs = (
-            self.db.query(RecommendationRefreshJob.sellerId)
-            .filter(
-                RecommendationRefreshJob.sellerId.in_(unique_seller_ids),
-                RecommendationRefreshJob.status.in_([self.PENDING, self.IN_PROGRESS]),
+        producer = get_kafka_producer()
+        if producer:
+            for seller_id in unique_seller_ids:
+                payload = {
+                    "seller_id": seller_id,
+                    "trigger": trigger,
+                    "requested_by": requested_by,
+                    "priority": priority or self._priority_for_trigger(trigger),
+                    "details": details or {}
+                }
+                producer.send(self.settings.kafka_refresh_topic, payload)
+            producer.flush()
+
+            queued_count = len(unique_seller_ids)
+
+            if _metrics_available and queued_count:
+                RECOMMENDATION_REFRESH_JOBS_TOTAL.labels(trigger=trigger, status="queued").inc(queued_count)
+
+            logger.info(
+                "Published %s refresh events to Kafka for trigger=%s",
+                queued_count,
+                trigger,
             )
-            .all()
-        )
-        existing_seller_ids = {row[0] for row in existing_jobs}
+            return {"queued": queued_count, "already_queued": 0}
 
-        queued_jobs = [
-            RecommendationRefreshJob(
-                sellerId=seller_id,
-                trigger=trigger,
-                status=self.PENDING,
-                priority=priority or self._priority_for_trigger(trigger),
-                requestedBy=requested_by,
-                details=details or {},
-            )
-            for seller_id in unique_seller_ids
-            if seller_id not in existing_seller_ids
-        ]
-        if queued_jobs:
-            self.db.add_all(queued_jobs)
-            self.db.commit()
-
-        queued_count = len(queued_jobs)
-        already_queued = len(unique_seller_ids) - queued_count
-
-        if _metrics_available and queued_count:
-            RECOMMENDATION_REFRESH_JOBS_TOTAL.labels(trigger=trigger, status="queued").inc(queued_count)
-
-        logger.info(
-            "Queued %s refresh jobs for trigger=%s (%s already queued)",
-            queued_count,
-            trigger,
-            already_queued,
-        )
-        return {"queued": queued_count, "already_queued": already_queued}
+        return {"queued": 0, "already_queued": len(unique_seller_ids)}
 
     def enqueue_active_sellers(
         self,
@@ -248,7 +249,7 @@ class RecommendationRefreshService:
             except Exception as exc:
                 self.db.rollback()
                 failed += 1
-                self._mark_job_failed(job.id, exc)
+                self._retry_or_fail(job.id, exc)
                 self._record_job_metric(job.trigger, "failed", time.perf_counter() - started)
                 logger.error(
                     "Recommendation refresh job %s failed for seller %r: %s",
@@ -284,7 +285,12 @@ class RecommendationRefreshService:
         self.db.commit()
         return job
 
-    def _mark_job_failed(self, job_id: int, error: Exception) -> None:
+    def _retry_or_fail(self, job_id: int, error: Exception) -> None:
+        """
+        Re-queue the job as PENDING if attempts remain; permanently fail it otherwise.
+
+        Priority is not reduced on retry so high-priority jobs stay high.
+        """
         job = (
             self.db.query(RecommendationRefreshJob)
             .filter(RecommendationRefreshJob.id == job_id)
@@ -292,10 +298,44 @@ class RecommendationRefreshService:
         )
         if job is None:
             return
-        job.status = self.FAILED
-        job.completedAt = datetime.utcnow()
-        job.lastError = str(error)[:1000]
-        self.db.commit()
+
+        attempts_used = int(job.attemptCount or 0)
+        max_attempts = _MAX_ATTEMPTS
+
+        if attempts_used < max_attempts:
+            # Re-queue for a future worker cycle
+            job.status = self.PENDING
+            job.startedAt = None
+            job.lastError = f"[attempt {attempts_used}/{max_attempts}] {str(error)[:500]}"
+            self.db.commit()
+            logger.warning(
+                "Refresh job %s re-queued after failure (attempt %s/%s): %s",
+                job_id,
+                attempts_used,
+                max_attempts,
+                error,
+            )
+            if _metrics_available:
+                RECOMMENDATION_REFRESH_JOBS_TOTAL.labels(
+                    trigger=job.trigger, status="retried"
+                ).inc()
+        else:
+            # Exhausted all attempts — mark permanently failed
+            job.status = self.FAILED
+            job.completedAt = datetime.utcnow()
+            job.lastError = f"[final failure after {attempts_used} attempts] {str(error)[:800]}"
+            self.db.commit()
+            logger.error(
+                "Refresh job %s permanently failed after %s attempts: %s",
+                job_id,
+                attempts_used,
+                error,
+            )
+
+    # Keep the old name as an alias for backward compatibility with callers
+    def _mark_job_failed(self, job_id: int, error: Exception) -> None:
+        """Alias kept for backward compatibility; delegates to _retry_or_fail."""
+        self._retry_or_fail(job_id, error)
 
     def _warm_cache(self, seller_id: str, recommendations: List[Dict]) -> None:
         if not self.settings.cache_enabled:

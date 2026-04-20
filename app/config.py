@@ -114,6 +114,23 @@ class Settings(BaseSettings):
         ge=1,
         description="Priority assigned to manual admin refresh jobs",
     )
+    refresh_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        description="Max times a failed refresh job is retried before being permanently marked FAILED",
+    )
+
+    # ============= WORKER =============
+    poll_interval_seconds: int = Field(
+        default=30,
+        ge=1,
+        description="Seconds the standalone worker sleeps between job-queue polls",
+    )
+    worker_batch_size: int = Field(
+        default=10,
+        ge=1,
+        description="Max jobs processed per poll cycle by the standalone worker",
+    )
 
     # ============= LOGGING =============
     log_level: str = Field(default="INFO")
@@ -121,6 +138,17 @@ class Settings(BaseSettings):
     # ============= FEATURE FLAGS =============
     enable_batch_queries: bool = Field(default=True, description="Use batch queries instead of N+1")
     enable_seller_scoped_signals: bool = Field(default=True, description="Use seller-specific signal scoping")
+    enable_ml_weights: bool = Field(default=True, description="Use adaptive ML weights per seller")
+
+    # ============= KAFKA =============
+    kafka_bootstrap_servers: str = Field(default="kafka:29092", description="Kafka broker address")
+    kafka_refresh_topic: str = Field(default="recommendation_refresh", description="Kafka topic for refresh events")
+
+    # ============= ALGORITHM TUNING =============
+    diversity_penalty_factor: float = Field(default=0.5, description="Penalty applied to duplicate categories")
+    max_per_category: int = Field(default=2, description="Max products per category before penalty")
+    cold_start_threshold: int = Field(default=5, description="Order count below which seller is considered cold start")
+    random_exploration_ratio: float = Field(default=0.05, description="Percentage of recommendations that are random")
 
     model_config = SettingsConfigDict(
         env_file=".env",
