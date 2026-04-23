@@ -125,13 +125,6 @@ class BulkRefreshResponse(BaseModel):
     already_queued: int
 
 
-class JobRunResponse(BaseModel):
-    status: str
-    processed: int
-    succeeded: int
-    failed: int
-
-
 router = APIRouter()
 cache_service = CacheService()
 
@@ -503,27 +496,6 @@ async def queue_active_seller_refresh(
         trigger="scheduled_refresh",
         queued=result["queued"],
         already_queued=result["already_queued"],
-    )
-
-
-@router.post(
-    "/jobs/run",
-    response_model=JobRunResponse,
-    summary="Process queued recommendation refresh jobs",
-    tags=["Admin"],
-    dependencies=[Depends(require_api_key)],
-)
-async def run_refresh_jobs(
-    limit: int = Query(10, ge=1, le=500, description="Maximum queued jobs to process"),
-    db: Session = Depends(get_db),
-) -> JobRunResponse:
-    refresh_service = build_refresh_service(db)
-    summary = refresh_service.run_pending_jobs(limit=limit)
-    return JobRunResponse(
-        status="completed",
-        processed=summary.processed,
-        succeeded=summary.succeeded,
-        failed=summary.failed,
     )
 
 

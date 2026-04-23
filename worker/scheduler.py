@@ -1,11 +1,8 @@
 """
 APScheduler-based recommendation refresh scheduler.
 
-Runs two recurring jobs:
-  1. drain_queue      — every DRAIN_INTERVAL_MINUTES (default: 5 min)
-     Processes up to BATCH_SIZE pending RecommendationRefreshJobs.
-
-  2. enqueue_active   — every ENQUEUE_INTERVAL_MINUTES (default: 30 min)
+Runs a recurring job:
+  1. enqueue_active   — every ENQUEUE_INTERVAL_MINUTES (default: 30 min)
      Queues refresh jobs for all recently active sellers.
 
 Usage:
@@ -13,12 +10,10 @@ Usage:
     python -m worker.scheduler
 
     # Override intervals
-    DRAIN_INTERVAL_MINUTES=2 ENQUEUE_INTERVAL_MINUTES=60 python -m worker.scheduler
+    ENQUEUE_INTERVAL_MINUTES=60 python -m worker.scheduler
 
 Environment variables (all optional with defaults):
-    DRAIN_INTERVAL_MINUTES      Minutes between queue-drain runs (default: 5)
     ENQUEUE_INTERVAL_MINUTES    Minutes between active-seller enqueue runs (default: 30)
-    BATCH_SIZE                  Jobs per drain cycle (default: 10)
     DATABASE_URL                Postgres connection string (required)
     REDIS_URL                   Redis connection string (required)
 """
@@ -41,9 +36,7 @@ from app.services.refresh_service import RecommendationRefreshService
 setup_logging()
 logger = logging.getLogger("worker.scheduler")
 
-_DRAIN_INTERVAL_MINUTES: int = int(os.getenv("DRAIN_INTERVAL_MINUTES", "5"))
 _ENQUEUE_INTERVAL_MINUTES: int = int(os.getenv("ENQUEUE_INTERVAL_MINUTES", "30"))
-_BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "10"))
 
 
 def _make_service() -> tuple[RecommendationRefreshService, object]:
@@ -57,30 +50,6 @@ def _make_service() -> tuple[RecommendationRefreshService, object]:
 
 
 # ── scheduled jobs ────────────────────────────────────────────────────────────
-
-def drain_queue() -> None:
-    """
-    Process up to BATCH_SIZE pending recommendation refresh jobs.
-
-    Called every DRAIN_INTERVAL_MINUTES by APScheduler.
-    """
-    svc, db = _make_service()
-    try:
-        summary = svc.run_pending_jobs(limit=_BATCH_SIZE)
-        if summary.processed > 0:
-            logger.info(
-                "[drain_queue] processed=%s succeeded=%s failed=%s",
-                summary.processed,
-                summary.succeeded,
-                summary.failed,
-            )
-        else:
-            logger.debug("[drain_queue] queue empty")
-    except Exception as exc:  # noqa: BLE001
-        logger.error("[drain_queue] error: %s", exc, exc_info=True)
-    finally:
-        db.close()
-
 
 def enqueue_active_sellers() -> None:
     """
@@ -112,24 +81,12 @@ def enqueue_active_sellers() -> None:
 def main() -> int:
     settings = get_settings()
     logger.info(
-        "Recommendation scheduler starting | env=%s drain=%smin enqueue=%smin batch=%s",
+        "Recommendation scheduler starting | env=%s enqueue=%smin",
         settings.environment,
-        _DRAIN_INTERVAL_MINUTES,
         _ENQUEUE_INTERVAL_MINUTES,
-        _BATCH_SIZE,
     )
 
     scheduler = BlockingScheduler(timezone="UTC")
-
-    scheduler.add_job(
-        drain_queue,
-        trigger=IntervalTrigger(minutes=_DRAIN_INTERVAL_MINUTES),
-        id="drain_queue",
-        name="Drain recommendation refresh job queue",
-        max_instances=1,          # Never run two drains in parallel
-        coalesce=True,            # Skip missed runs rather than pile up
-        replace_existing=True,
-    )
 
     scheduler.add_job(
         enqueue_active_sellers,
@@ -141,10 +98,18 @@ def main() -> int:
         replace_existing=True,
     )
 
-    # Also run both jobs immediately on startup so the first cycle doesn't
-    # wait for the full interval.
-    scheduler.add_job(enqueue_active_sellers, id="enqueue_active_sellers_boot", name="Boot: enqueue active sellers")
-    scheduler.add_job(drain_queue, id="drain_queue_boot", name="Boot: drain queue")
+    def _boot_enqueue_active_sellers():
+        from app.services.refresh_service import get_kafka_producer
+        import time
+        for _ in range(15):
+            if get_kafka_producer() is not None:
+                break
+            logger.info("Waiting for Kafka before boot enqueue...")
+            time.sleep(2)
+        enqueue_active_sellers()
+
+    # Run job immediately on startup so the first cycle doesn't wait for full interval
+    scheduler.add_job(_boot_enqueue_active_sellers, id="enqueue_active_sellers_boot", name="Boot: enqueue active sellers")
 
     def _handle_signal(signum: int, _frame: object) -> None:
         sig_name = signal.Signals(signum).name
