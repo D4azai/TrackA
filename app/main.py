@@ -154,7 +154,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
-        port=settings.service_port,
+        port=settings.effective_port,
         reload=settings.is_development,
         log_level="info"
     )

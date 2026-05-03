@@ -38,7 +38,8 @@ class Settings(BaseSettings):
 
     # ============= SERVICE =============
     service_name: str = "recommendation-service"
-    service_port: int = 8000
+    service_port: int = Field(default=8000, description="Internal service port (overridden by $PORT on Railway)")
+    port: Optional[int] = Field(default=None, description="Railway-injected $PORT — takes precedence over service_port")
     environment: str = Field(default="development", description="development, staging, or production")
     debug: bool = False
 
@@ -48,8 +49,8 @@ class Settings(BaseSettings):
         description="Allowed CORS origins"
     )
     allowed_hosts: List[str] = Field(
-        default=["localhost", "127.0.0.1"],
-        description="Allowed Host header values"
+        default=["*"],
+        description="Allowed Host header values. Use ['*'] on Railway to accept any hostname."
     )
     admin_api_key: Optional[str] = Field(
         default=None,
@@ -141,7 +142,7 @@ class Settings(BaseSettings):
     enable_ml_weights: bool = Field(default=True, description="Use adaptive ML weights per seller")
 
     # ============= KAFKA =============
-    kafka_bootstrap_servers: str = Field(default="kafka:29092", description="Kafka broker address")
+    kafka_bootstrap_servers: str = Field(default="", description="Kafka broker address (leave empty if Kafka not deployed)")
     kafka_refresh_topic: str = Field(default="recommendation_refresh", description="Kafka topic for refresh events")
 
     # ============= ALGORITHM TUNING =============
@@ -174,6 +175,11 @@ class Settings(BaseSettings):
                 f"weight_recency, weight_newness in environment"
             )
         return weights
+
+    @property
+    def effective_port(self) -> int:
+        """Return Railway's $PORT if set, otherwise fall back to service_port."""
+        return self.port if self.port is not None else self.service_port
 
     @property
     def is_production(self) -> bool:
