@@ -34,9 +34,15 @@ async def lifespan(app: FastAPI):
     """
     logger.info("🚀 Recommendation service starting up...")
 
-    # Test database connection
+    # Test database connection and create tables
     if test_connection():
         logger.info("✅ Database connection verified")
+        try:
+            from app.models import Base
+            Base.metadata.create_all(bind=engine)
+            logger.info("✅ Database tables verified/created")
+        except Exception as e:
+            logger.error(f"⚠️ Failed to create database tables: {e}")
     else:
         logger.warning("⚠️ Database connection failed — service may not work correctly")
 
