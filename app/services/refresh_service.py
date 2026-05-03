@@ -9,10 +9,7 @@ import time
 import json
 from typing import Dict, Iterable, List, Optional
 
-try:
-    from kafka import KafkaProducer
-except ImportError:
-    KafkaProducer = None
+
 
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
@@ -41,19 +38,7 @@ settings = get_settings()
 # permanently marked FAILED. Override with REFRESH_MAX_ATTEMPTS in .env.
 _MAX_ATTEMPTS: int = settings.refresh_max_attempts
 
-_kafka_producer = None
 
-def get_kafka_producer():
-    global _kafka_producer
-    if _kafka_producer is None and KafkaProducer is not None:
-        try:
-            _kafka_producer = KafkaProducer(
-                bootstrap_servers=settings.kafka_bootstrap_servers,
-                value_serializer=lambda v: json.dumps(v).encode('utf-8')
-            )
-        except Exception as e:
-            logger.error(f"Failed to connect to Kafka: {e}")
-    return _kafka_producer
 
 
 @dataclass
@@ -99,31 +84,39 @@ class RecommendationRefreshService:
         priority: Optional[int] = None,
         details: Optional[Dict] = None,
     ) -> RefreshEnqueueResult:
-        """Publish a refresh event to Kafka."""
-        producer = get_kafka_producer()
-        if producer:
-            payload = {
-                "seller_id": seller_id,
-                "trigger": trigger,
-                "requested_by": requested_by,
-                "priority": priority or self._priority_for_trigger(trigger),
-                "details": details or {}
-            }
-            producer.send(self.settings.kafka_refresh_topic, payload)
-            producer.flush()
-
-            if _metrics_available:
-                RECOMMENDATION_REFRESH_JOBS_TOTAL.labels(trigger=trigger, status="queued").inc()
-
-            logger.info(
-                "Published recommendation refresh event to Kafka for seller %r (trigger=%s)",
-                seller_id,
-                trigger,
+        """Queue a durable recommendation refresh job in the database."""
+        # Check if an identical job is already pending
+        existing = (
+            self.db.query(RecommendationRefreshJob.id)
+            .filter(
+                RecommendationRefreshJob.sellerId == seller_id,
+                RecommendationRefreshJob.status == self.PENDING,
             )
-            return RefreshEnqueueResult(job_id=None, created=True, status="KAFKA_PUBLISHED")
+            .first()
+        )
+        if existing:
+            return RefreshEnqueueResult(job_id=existing[0], created=False, status="ALREADY_QUEUED")
 
-        logger.error("Failed to publish to Kafka (producer not available)")
-        return RefreshEnqueueResult(job_id=None, created=False, status="KAFKA_ERROR")
+        job = RecommendationRefreshJob(
+            sellerId=seller_id,
+            trigger=trigger,
+            requestedBy=requested_by,
+            priority=priority or self._priority_for_trigger(trigger),
+            details=details or {},
+        )
+        self.db.add(job)
+        self.db.commit()
+
+        if _metrics_available:
+            RECOMMENDATION_REFRESH_JOBS_TOTAL.labels(trigger=trigger, status="queued").inc()
+
+        logger.info(
+            "Queued recommendation refresh job %s for seller %r (trigger=%s)",
+            job.id,
+            seller_id,
+            trigger,
+        )
+        return RefreshEnqueueResult(job_id=job.id, created=True, status="QUEUED")
 
     def enqueue_many_sellers(
         self,
@@ -133,37 +126,47 @@ class RecommendationRefreshService:
         priority: Optional[int] = None,
         details: Optional[Dict] = None,
     ) -> Dict[str, int]:
-        """Publish refresh events for many sellers to Kafka."""
+        """Bulk queue refresh jobs for multiple sellers."""
         unique_seller_ids = list(dict.fromkeys(seller_ids))
         if not unique_seller_ids:
             return {"queued": 0, "already_queued": 0}
 
-        producer = get_kafka_producer()
-        if producer:
-            for seller_id in unique_seller_ids:
-                payload = {
-                    "seller_id": seller_id,
-                    "trigger": trigger,
-                    "requested_by": requested_by,
-                    "priority": priority or self._priority_for_trigger(trigger),
-                    "details": details or {}
-                }
-                producer.send(self.settings.kafka_refresh_topic, payload)
-            producer.flush()
+        # Find existing pending jobs to avoid duplicates
+        existing_records = (
+            self.db.query(RecommendationRefreshJob.sellerId)
+            .filter(
+                RecommendationRefreshJob.sellerId.in_(unique_seller_ids),
+                RecommendationRefreshJob.status == self.PENDING,
+            )
+            .all()
+        )
+        existing_seller_ids = {r[0] for r in existing_records}
+        sellers_to_queue = [sid for sid in unique_seller_ids if sid not in existing_seller_ids]
 
-            queued_count = len(unique_seller_ids)
+        if sellers_to_queue:
+            jobs = [
+                RecommendationRefreshJob(
+                    sellerId=sid,
+                    trigger=trigger,
+                    requestedBy=requested_by,
+                    priority=priority or self._priority_for_trigger(trigger),
+                    details=details or {},
+                )
+                for sid in sellers_to_queue
+            ]
+            self.db.add_all(jobs)
+            self.db.commit()
 
-            if _metrics_available and queued_count:
-                RECOMMENDATION_REFRESH_JOBS_TOTAL.labels(trigger=trigger, status="queued").inc(queued_count)
+            if _metrics_available:
+                RECOMMENDATION_REFRESH_JOBS_TOTAL.labels(trigger=trigger, status="queued").inc(
+                    len(jobs)
+                )
 
             logger.info(
-                "Published %s refresh events to Kafka for trigger=%s",
-                queued_count,
-                trigger,
+                "Queued %s recommendation refresh jobs (trigger=%s)", len(jobs), trigger
             )
-            return {"queued": queued_count, "already_queued": 0}
 
-        return {"queued": 0, "already_queued": len(unique_seller_ids)}
+        return {"queued": len(sellers_to_queue), "already_queued": len(existing_seller_ids)}
 
     def enqueue_active_sellers(
         self,

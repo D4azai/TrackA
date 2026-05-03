@@ -99,13 +99,6 @@ def main() -> int:
     )
 
     def _boot_enqueue_active_sellers():
-        from app.services.refresh_service import get_kafka_producer
-        import time
-        for _ in range(15):
-            if get_kafka_producer() is not None:
-                break
-            logger.info("Waiting for Kafka before boot enqueue...")
-            time.sleep(2)
         enqueue_active_sellers()
 
     # Run job immediately on startup so the first cycle doesn't wait for full interval
