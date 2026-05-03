@@ -13,6 +13,10 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements-worker.txt
 COPY app ./app
 COPY worker ./worker
 
+# Copy start script
+COPY start.sh ./
+RUN chmod +x start.sh
+
 ENV PYTHONUNBUFFERED=1
 
 USER 10001
