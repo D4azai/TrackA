@@ -115,10 +115,17 @@ class RecommendationEngine:
         candidate_ids = candidate_ids[: limit * 2]
 
         if not candidate_ids:
-            logger.warning(f"No candidate products found for seller {seller_id!r}")
+            logger.warning(
+                f"No candidate products found for seller {seller_id!r}. "
+                f"Stats: {len(popular)} popular, {len(history)} history, "
+                f"fallback needed={needed}. Check if products are AVAILABLE and isPublic."
+            )
             return []
 
-        logger.info(f"Candidate pool: {len(candidate_ids)} products")
+        logger.info(
+            f"Candidate pool: {len(candidate_ids)} products for seller {seller_id!r}. "
+            f"(Popular: {len(popular)}, History: {len(history)}, Fallback added: {len(fallback_ids) if needed > 0 else 0})"
+        )
 
         # ======================================================
         # STEP 2: BATCH-FETCH ALL SIGNALS

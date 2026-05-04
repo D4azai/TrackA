@@ -257,6 +257,11 @@ async def get_recommendations(
     """
     try:
         t_start = time.time()
+        
+        # Safe debug log for database host
+        db_host = db.get_bind().url.host
+        logger.info(f"Processing recommendation request for seller {seller_id!r}. DB Host: {db_host}")
+        
         seller_id = normalize_seller_id(seller_id)
         precomputed_service = build_precomputed_service(db)
         refresh_service = build_refresh_service(db)
@@ -324,10 +329,31 @@ async def get_recommendations(
             )
 
         enqueue_refresh(refresh_service, seller_id, "request_miss", limit)
-        record_response_source("queued_empty")
+        record_response_source("queued_fallback")
+        
+        logger.info(
+            f"[Fallback] Snapshot missing and sync_fallback disabled for seller {seller_id!r}. "
+            f"Fetching popular products as lightweight fallback."
+        )
+        
+        popular_data = refresh_service.data_service.get_popular_products(limit=limit)
+        fallback_recs = []
+        for i, item in enumerate(popular_data, 1):
+            fallback_recs.append(Recommendation(
+                product_id=item["product_id"],
+                score=item["score"],
+                rank=i,
+                is_personalized=False,
+                sources=RecommendationSource(
+                    popularity=item["score"], history=0.0, recency=0.0, newness=0.0, engagement=0.0
+                )
+            ))
+            
+        logger.info(f"[Fallback] Returned {len(fallback_recs)} popular products for seller {seller_id!r}.")
+
         return build_recommendation_response(
             seller_id=seller_id,
-            recommendations=[],
+            recommendations=fallback_recs,
             cache_hit=False,
             elapsed_ms=(time.time() - t_start) * 1000,
         )
