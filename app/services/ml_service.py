@@ -28,7 +28,22 @@ class MLWeightOptimizer:
 
         weights = self.base_weights.copy()
 
-        if seller_history_size < self.cold_start_threshold:
+        if seller_history_size == 0:
+            # Absolute Cold Start (No History)
+            # Remove all history and recency weight
+            history_shift = weights["history"]
+            recency_shift = weights["recency"]
+            weights["history"] = 0.0
+            weights["recency"] = 0.0
+            
+            total_shift = history_shift + recency_shift
+            
+            # Distribute to popularity and newness
+            weights["newness"] += total_shift * 0.5
+            weights["popularity"] += total_shift * 0.5
+            logger.debug("Applied ZERO-HISTORY ML weights (history size 0)")
+
+        elif seller_history_size < self.cold_start_threshold:
             # Cold Start Profile
             # Shift weight from history to newness and popularity
             history_shift = weights["history"] * 0.6  # take away 60% of history weight

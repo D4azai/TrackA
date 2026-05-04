@@ -249,10 +249,17 @@ class RecommendationEngine:
         personalized_count = sum(1 for r in recommendations if r["is_personalized"])
         logger.info(
             f"Generated {len(recommendations)} recommendations for seller {seller_id!r} "
-            f"({personalized_count} personalized) — top score: "
-            f"{recommendations[0]['score'] if recommendations else 0} "
-            f"in {elapsed * 1000:.1f}ms"
+            f"({personalized_count} personalized) in {elapsed * 1000:.1f}ms. "
+            f"Used weights: Popularity={weights['popularity']}, History={weights['history']}, "
+            f"Recency={weights['recency']}, Newness={weights['newness']}, Engagement={weights['engagement']}"
         )
+
+        # Detailed debug logging for top 3 products
+        for idx, rec in enumerate(recommendations[:3]):
+            logger.debug(
+                f"Top #{idx+1} (Product {rec['product_id']}) -> Final Score: {rec['score']} "
+                f"| Sources: {rec['sources']}"
+            )
 
         return recommendations
 

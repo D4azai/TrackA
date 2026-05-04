@@ -275,7 +275,7 @@ class DataService:
     def get_engagement_scores_batch(
         self,
         product_ids: List[int],
-        days: int = 30
+        days: int = 180
     ) -> Dict[int, Dict]:
         """
         Get engagement scores for MULTIPLE products in ONE query.
