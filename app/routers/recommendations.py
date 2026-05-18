@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
+
 from app.config import get_settings
 from app.db import get_db
 from app.meta import VERSION
@@ -551,3 +552,63 @@ async def clear_cache(
     except Exception as exc:
         logger.error("Error clearing cache: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to clear cache")
+
+from sqlalchemy import func
+from pydantic import BaseModel
+from typing import List, Optional
+from app.models import SellerRecommendation
+
+class TopRecommendedProductItem(BaseModel):
+    product_id: str
+    recommendation_count: int
+    average_score: float
+
+class TopRecommendedResponse(BaseModel):
+    items: List[TopRecommendedProductItem]
+
+@router.get(
+    "/analytics/top-products",
+    response_model=TopRecommendedResponse,
+    summary="Get most frequently recommended products across the platform",
+    tags=["Analytics"],
+    dependencies=[Depends(require_api_key)],
+)
+async def get_top_recommended_products(
+    limit: int = Query(20, ge=1, le=100),
+    seller_id: Optional[str] = Query(None, description="Optional filter by seller"),
+    db: Session = Depends(get_db),
+) -> TopRecommendedResponse:
+    """
+    Admin analytics endpoint: Aggregates the SellerRecommendation table to find 
+    which products are recommended the most across the platform.
+    """
+    try:
+        query = db.query(
+            SellerRecommendation.productId.label("product_id"),
+            func.count(SellerRecommendation.id).label("recommendation_count"),
+            func.avg(SellerRecommendation.score).label("average_score")
+        )
+        
+        # Apply optional filters
+        if seller_id:
+            query = query.filter(SellerRecommendation.sellerId == seller_id)
+            
+        results = (
+            query.group_by(SellerRecommendation.productId)
+            .order_by(func.count(SellerRecommendation.id).desc())
+            .limit(limit)
+            .all()
+        )
+        
+        items = [
+            TopRecommendedProductItem(
+                product_id=str(row.product_id),
+                recommendation_count=row.recommendation_count,
+                average_score=round(row.average_score, 2) if row.average_score else 0.0
+            )
+            for row in results
+        ]
+        return TopRecommendedResponse(items=items)
+    except Exception as exc:
+        logger.error("Error aggregating top recommendations: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to aggregate recommendations")
