@@ -138,6 +138,11 @@ def create_app() -> FastAPI:
                 "cache_clear": "POST /api/recommend/cache/clear",
                 "refresh_seller": "POST /api/recommend/refresh/seller",
                 "refresh_jobs_run": "POST /api/recommend/jobs/run",
+                "events_order_placed": "POST /api/recommend/events/order-placed",
+                "events_product_engaged": "POST /api/recommend/events/product-engaged",
+                "events_product_updated": "POST /api/recommend/events/product-updated",
+                "events_seller_created": "POST /api/recommend/events/seller-created",
+                "analytics_top_products": "GET /api/recommend/analytics/top-products",
                 "metrics": "GET /metrics"
             },
             "docs": "/docs" if settings.is_development else "disabled in production"

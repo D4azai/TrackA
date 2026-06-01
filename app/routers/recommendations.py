@@ -22,6 +22,7 @@ from app.config import get_settings
 from app.db import get_db
 from app.meta import VERSION
 from app.services.cache_service import CacheService
+from app.services.data_service import DataService
 from app.services.precomputed_service import (
     PrecomputedRecommendationService,
 )
@@ -62,6 +63,10 @@ class Recommendation(BaseModel):
         default=False,
         description="True if seller-specific signals influenced this recommendation",
     )
+    is_exploration: bool = Field(
+        default=False,
+        description="True if this item was injected for diversity/exploration purposes",
+    )
     sources: RecommendationSource = Field(..., description="Score breakdown by signal")
 
 
@@ -91,6 +96,12 @@ class SellerRefreshRequest(BaseModel):
 class OrderPlacedEvent(BaseModel):
     seller_id: str = Field(..., min_length=1, max_length=128)
     order_id: Optional[int] = None
+    requested_by: Optional[str] = Field(default=None, max_length=128)
+
+
+class SellerCreatedEvent(BaseModel):
+    """Event payload when a new seller registers on the platform."""
+    seller_id: str = Field(..., min_length=1, max_length=128)
     requested_by: Optional[str] = Field(default=None, max_length=128)
 
 
@@ -248,6 +259,14 @@ async def get_recommendations(
         le=settings.max_limit,
         description=f"Number of recommendations to return (1-{settings.max_limit})",
     ),
+    seller_type: Optional[str] = Query(
+        None,
+        description="Seller tier (NORMAL, PRO, VIP). If omitted, looked up from DB.",
+    ),
+    warehouse_id: Optional[int] = Query(
+        None,
+        description="Seller's fulfillment warehouse ID. Filters out-of-stock products.",
+    ),
     db: Session = Depends(get_db),
 ) -> RecommendationResponse:
     """
@@ -320,6 +339,8 @@ async def get_recommendations(
             refreshed = refresh_service.refresh_seller_now(
                 seller_id=seller_id,
                 trigger="sync_fallback",
+                seller_type=seller_type,
+                warehouse_id=warehouse_id,
             )
             record_response_source("sync_fallback")
             return build_recommendation_response(
@@ -337,7 +358,9 @@ async def get_recommendations(
             f"Fetching popular products as lightweight fallback."
         )
         
-        popular_data = refresh_service.data_service.get_popular_products(limit=limit)
+        popular_data = DataService(
+            db, seller_id=seller_id, seller_type=seller_type, warehouse_id=warehouse_id
+        ).get_popular_products(limit=limit)
         fallback_recs = []
         for i, item in enumerate(popular_data, 1):
             fallback_recs.append(Recommendation(
@@ -437,6 +460,9 @@ async def order_placed_event(
         requested_by=payload.requested_by or "event",
         details={"order_id": payload.order_id},
     )
+    # Invalidate this seller's cache immediately so stale recommendations
+    # aren't served while the refresh job runs
+    cache_service.delete(seller_id)
     return RefreshJobResponse(
         status="queued" if result.created else "already_queued",
         seller_id=seller_id,
@@ -467,6 +493,43 @@ async def product_engaged_event(
             "event_type": payload.event_type,
         },
     )
+    # Invalidate seller cache so engagement signal is reflected sooner
+    cache_service.delete(seller_id)
+    return RefreshJobResponse(
+        status="queued" if result.created else "already_queued",
+        seller_id=seller_id,
+        job_id=result.job_id,
+        created=result.created,
+    )
+
+
+@router.post(
+    "/events/seller-created",
+    response_model=RefreshJobResponse,
+    summary="Pre-compute recommendations for a newly registered seller",
+    tags=["Events"],
+    dependencies=[Depends(require_api_key)],
+)
+async def seller_created_event(
+    payload: SellerCreatedEvent,
+    db: Session = Depends(get_db),
+) -> RefreshJobResponse:
+    """
+    Triggered when a new seller registers on the platform.
+
+    Immediately queues a high-priority refresh job so the seller gets
+    personalized (popularity-based) recommendations on their first visit
+    instead of a generic fallback.
+    """
+    seller_id = normalize_seller_id(payload.seller_id)
+    refresh_service = build_refresh_service(db)
+    result = refresh_service.enqueue_seller_refresh(
+        seller_id=seller_id,
+        trigger="seller_created",
+        requested_by=payload.requested_by or "event",
+        priority=settings.refresh_manual_priority,  # High priority for immediate processing
+        details={"reason": "new_seller_onboarding"},
+    )
     return RefreshJobResponse(
         status="queued" if result.created else "already_queued",
         seller_id=seller_id,
@@ -493,6 +556,9 @@ async def product_updated_event(
         limit=payload.seller_limit,
         details={"product_id": payload.product_id},
     )
+    # Invalidate all recommendation caches so stale product data isn't served
+    # while refresh jobs are processing
+    cache_service.clear_all()
     return BulkRefreshResponse(
         status="queued",
         trigger="product_updated",

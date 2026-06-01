@@ -7,16 +7,22 @@ All queries are optimized:
 - Proper JOINs and GROUP BY
 - Seller-scoped signals where appropriate
 - Only AVAILABLE products are ever surfaced
+- Respects product visibility (isPublic + allowedSellerIds + minimumSellerType)
+- Filters out products with zero stock in the seller's warehouse
 """
 
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional, Set
 
-from sqlalchemy import func, and_, desc, text
+from sqlalchemy import func, and_, desc, or_, text
 from sqlalchemy.orm import Session
 
-from app.models import Order, OrderItem, Product, ProductReaction, ProductComment
+from app.models import (
+    Order, OrderItem, Product, ProductReaction, ProductComment,
+    ProductVariantAssignment, WarehouseStock, User,
+    SELLER_TYPE_HIERARCHY,
+)
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -32,30 +38,138 @@ class DataService:
     - Batch operations where possible
     - Proper JOINs and GROUP BY
     - Seller-scoped signals (not global)
-    - Only surfaces AVAILABLE products
+    - Only surfaces AVAILABLE products visible to the requesting seller
+    - Enforces minimumSellerType tier restrictions
+    - Filters out-of-stock products for the seller's warehouse
     """
 
-    def __init__(self, db_session: Session):
+    def __init__(
+        self,
+        db_session: Session,
+        seller_id: Optional[str] = None,
+        seller_type: Optional[str] = None,
+        warehouse_id: Optional[int] = None,
+    ):
         self.db = db_session
         self.settings = settings
+        self._seller_id = seller_id
+        self._seller_type = seller_type
+        self._warehouse_id = warehouse_id
+
+    def _get_seller_type(self) -> Optional[str]:
+        """Resolve seller type — use cached value or fetch from DB."""
+        if self._seller_type:
+            return self._seller_type
+        if not self._seller_id:
+            return None
+        user = self.db.query(User.sellerType).filter(User.id == self._seller_id).first()
+        if user:
+            self._seller_type = user[0] or "NORMAL"
+        return self._seller_type
+
+    def _product_visibility_filter(self, seller_id: Optional[str] = None):
+        """
+        Build a SQLAlchemy filter clause that enforces product visibility.
+
+        A product is visible to a seller if:
+        1. Product.status == "AVAILABLE"
+        2. Product.isPublic == True OR seller's ID is in Product.allowedSellerIds
+        3. Seller's type meets or exceeds Product.minimumSellerType
+
+        This prevents restricted products from leaking into recommendations
+        for unauthorized sellers.
+        """
+        sid = seller_id or self._seller_id
+        base_filter = and_(
+            Product.status == "AVAILABLE",
+        )
+
+        # Visibility: public or explicitly allowed
+        if sid:
+            visibility = or_(
+                Product.isPublic == True,
+                Product.allowedSellerIds.contains([sid]),
+            )
+        else:
+            visibility = Product.isPublic == True
+
+        # Seller type tier enforcement
+        seller_type = self._get_seller_type()
+        if seller_type:
+            seller_tier = SELLER_TYPE_HIERARCHY.get(seller_type, 0)
+            # Only show products where the seller's tier >= product's minimum tier
+            # We filter by listing all allowed minimumSellerType values
+            allowed_product_types = [
+                ptype for ptype, tier in SELLER_TYPE_HIERARCHY.items()
+                if tier <= seller_tier
+            ]
+            type_filter = Product.minimumSellerType.in_(allowed_product_types)
+        else:
+            # No seller type info — only show NORMAL products (safest default)
+            type_filter = Product.minimumSellerType == "NORMAL"
+
+        return and_(base_filter, visibility, type_filter)
+
+    def _get_in_stock_product_ids(self, product_ids: List[int]) -> Set[int]:
+        """
+        Return the subset of product_ids that have available stock (quantity - reservedQuantity > 0)
+        in the seller's warehouse.
+
+        If no warehouse_id is configured, returns all product_ids (no filtering).
+        """
+        if not self._warehouse_id or not product_ids:
+            return set(product_ids)
+
+        try:
+            results = (
+                self.db.query(ProductVariantAssignment.productId)
+                .join(
+                    WarehouseStock,
+                    WarehouseStock.productVariantAssignmentId == ProductVariantAssignment.id,
+                )
+                .filter(
+                    and_(
+                        ProductVariantAssignment.productId.in_(product_ids),
+                        ProductVariantAssignment.isActive == True,
+                        WarehouseStock.warehouseId == self._warehouse_id,
+                        (WarehouseStock.quantity - WarehouseStock.reservedQuantity) > 0,
+                    )
+                )
+                .distinct()
+                .all()
+            )
+            in_stock = {row[0] for row in results}
+            filtered_count = len(product_ids) - len(in_stock)
+            if filtered_count > 0:
+                logger.info(
+                    f"Stock filter removed {filtered_count} out-of-stock products "
+                    f"(warehouse {self._warehouse_id})"
+                )
+            return in_stock
+
+        except Exception as e:
+            logger.warning(f"Stock check failed, skipping filter: {e}")
+            return set(product_ids)
 
     # ==================== POPULARITY SIGNALS ====================
 
     def get_popular_products(
         self,
         limit: int = 20,
-        days: int = 90
+        days: int = 90,
+        seller_id: Optional[str] = None,
     ) -> List[Dict]:
         """
         Get popular products based on recent order volume.
 
         Uses: Order count + quantity in specified time period.
         Scope: ALL sellers (global popularity).
-        Filter: Only AVAILABLE products.
+        Filter: Only AVAILABLE products visible to the requesting seller.
 
         Args:
             limit: Maximum products to return
             days: Lookback period (default 90 days)
+            seller_id: Seller requesting recommendations (for visibility filtering)
 
         Returns:
             List of dicts with product_id, order_count, total_quantity, score
@@ -64,6 +178,7 @@ class DataService:
         """
         try:
             cutoff_date = datetime.utcnow() - timedelta(days=days)
+            sid = seller_id or self._seller_id
 
             results = self.db.query(
                 OrderItem.productId,
@@ -77,8 +192,7 @@ class DataService:
                 and_(
                     Order.createdAt >= cutoff_date,
                     Order.status.in_(["CONFIRMED", "COMPLETED", "IN_DELIVERY", "PROCESSING"]),
-                    Product.status == "AVAILABLE",
-                    Product.isPublic == True,
+                    self._product_visibility_filter(sid),
                 )
             ).group_by(
                 OrderItem.productId
@@ -89,16 +203,22 @@ class DataService:
             popular = []
             for product_id, order_count, total_qty in results:
                 total_qty = total_qty or 0
-                order_score = min((order_count / 100) * 100, 100)
-                qty_score = min((total_qty / 500) * 100, 100)
-                score = (order_score * 0.6) + (qty_score * 0.4)
-
                 popular.append({
                     "product_id": product_id,
                     "order_count": int(order_count),
                     "total_quantity": int(total_qty),
-                    "score": round(score, 2),
+                    "score": 0.0,  # placeholder, normalized below
                 })
+
+            # Rank-based normalization: top product = 100, bottom = scaled proportionally.
+            # This adapts automatically regardless of absolute order volumes.
+            if popular:
+                max_orders = popular[0]["order_count"]  # results are ORDER BY desc
+                max_qty = max((p["total_quantity"] for p in popular), default=1) or 1
+                for item in popular:
+                    order_score = (item["order_count"] / max_orders) * 100 if max_orders > 0 else 0
+                    qty_score = (item["total_quantity"] / max_qty) * 100 if max_qty > 0 else 0
+                    item["score"] = round((order_score * 0.6) + (qty_score * 0.4), 2)
 
             logger.info(f"Found {len(popular)} popular products (last {days}d)")
             return popular
@@ -118,7 +238,7 @@ class DataService:
         """
         Get seller's order history with category preferences.
 
-        Filter: Only AVAILABLE products (avoids recommending things no longer for sale).
+        Filter: Only AVAILABLE products visible to the seller.
 
         Args:
             seller_id: Seller ID
@@ -147,7 +267,7 @@ class DataService:
                     Order.sellerId == seller_id,
                     Order.createdAt >= cutoff_date,
                     Order.status.in_(["CONFIRMED", "COMPLETED", "IN_DELIVERY", "PROCESSING"]),
-                    Product.status == "AVAILABLE",
+                    self._product_visibility_filter(seller_id),
                 )
             ).group_by(
                 Product.id,
@@ -360,7 +480,12 @@ class DataService:
         """
         Get SELLER-SCOPED recency scores for MULTIPLE products.
 
-        Uses seller-specific recency: when did THIS SELLER last order each product.
+        Uses an inverse-U reorder curve optimized for affiliate marketplace behavior:
+        - Products ordered 0-7 days ago score LOW (seller just stocked up)
+        - Products ordered 10-40 days ago score HIGH (restock window)
+        - Products ordered 60+ days ago decay toward 0 (seller moved on)
+
+        Peak reorder window: 15-30 days (score = 100)
 
         Args:
             seller_id: Seller ID for scoping
@@ -396,14 +521,30 @@ class DataService:
             for product_id, last_ordered in results:
                 days_ago = (now - last_ordered).days if last_ordered else 999
 
-                # Piecewise linear decay:
-                # 0 days ago → 100,  30 days → ~20,  90+ days → 0
-                if days_ago == 0:
+                # Inverse-U reorder curve:
+                # 0-7 days:   low (just bought, no need to reorder)  → ramps from 30 to 70
+                # 8-14 days:  rising (approaching restock)           → ramps from 70 to 100
+                # 15-40 days: peak reorder window                    → 100
+                # 41-60 days: declining (might have switched)        → decays from 100 to 30
+                # 61-90 days: low (likely moved on)                  → decays from 30 to 0
+                # 90+ days:   zero
+                if days_ago <= 7:
+                    # Recently ordered — low urgency to reorder
+                    score = 30.0 + (days_ago / 7.0) * 40.0
+                elif days_ago <= 14:
+                    # Approaching restock window
+                    score = 70.0 + ((days_ago - 7) / 7.0) * 30.0
+                elif days_ago <= 40:
+                    # Peak reorder window
                     score = 100.0
-                elif days_ago <= 30:
-                    score = 100 - (days_ago * 2.67)
+                elif days_ago <= 60:
+                    # Declining — seller might have switched
+                    score = 100.0 - ((days_ago - 40) / 20.0) * 70.0
+                elif days_ago <= 90:
+                    # Low — likely moved on
+                    score = 30.0 - ((days_ago - 60) / 30.0) * 30.0
                 else:
-                    score = max(0.0, 20 - ((days_ago - 30) * 0.22))
+                    score = 0.0
 
                 recency_data[product_id] = {
                     "last_ordered_at": last_ordered,
@@ -426,6 +567,83 @@ class DataService:
             logger.error(f"Error getting recency scores: {str(e)}")
             return {pid: {"last_ordered_at": None, "days_ago": 999, "recency_score": 0.0}
                     for pid in product_ids}
+
+    # ==================== NEGATIVE SIGNALS (BATCH) - SELLER SCOPED ====================
+
+    def get_negative_signals_batch(
+        self,
+        seller_id: str,
+        product_ids: List[int],
+        days: int = 180,
+    ) -> Dict[int, Dict]:
+        """
+        Get negative signals for products: cancelled orders by this seller.
+
+        A cancelled order indicates the seller tried to buy but backed out.
+        This is a weak negative signal — it shouldn't completely suppress a product,
+        but it should reduce its score.
+
+        Penalty scale:
+        - 1 cancellation:  penalty = 15
+        - 2 cancellations: penalty = 30
+        - 3+ cancellations: penalty = 50 (capped)
+
+        Args:
+            seller_id: Seller ID
+            product_ids: Candidate product IDs
+            days: Lookback window
+
+        Returns:
+            Dict mapping product_id -> {cancel_count, penalty_score}
+            penalty_score is 0-50 (higher = more penalty to subtract)
+
+        Query: 1 DB query
+        """
+        if not product_ids:
+            return {}
+
+        try:
+            cutoff_date = datetime.utcnow() - timedelta(days=days)
+
+            results = self.db.query(
+                OrderItem.productId,
+                func.count(OrderItem.orderId).label("cancel_count"),
+            ).join(
+                Order, Order.id == OrderItem.orderId
+            ).filter(
+                and_(
+                    OrderItem.productId.in_(product_ids),
+                    Order.sellerId == seller_id,
+                    Order.status == "CANCELLED",
+                    Order.createdAt >= cutoff_date,
+                )
+            ).group_by(
+                OrderItem.productId
+            ).all()
+
+            negative_data: Dict[int, Dict] = {}
+            for product_id, cancel_count in results:
+                cancel_count = cancel_count or 0
+                # Diminishing penalty: 15 per cancel, capped at 50
+                penalty = min(cancel_count * 15, 50)
+                negative_data[product_id] = {
+                    "cancel_count": int(cancel_count),
+                    "penalty_score": float(penalty),
+                }
+
+            # Zero-fill products with no cancellations
+            for pid in product_ids:
+                if pid not in negative_data:
+                    negative_data[pid] = {
+                        "cancel_count": 0,
+                        "penalty_score": 0.0,
+                    }
+
+            return negative_data
+
+        except Exception as e:
+            logger.error(f"Error getting negative signals: {str(e)}")
+            return {pid: {"cancel_count": 0, "penalty_score": 0.0} for pid in product_ids}
 
     # ==================== NEWNESS SIGNALS (BATCH) ====================
 
@@ -490,7 +708,8 @@ class DataService:
     def get_catalog_fallback_products(
         self,
         limit: int,
-        exclude_ids: List[int] = None
+        exclude_ids: List[int] = None,
+        seller_id: Optional[str] = None,
     ) -> List[int]:
         """
         Fallback: fetch AVAILABLE products from the full catalog.
@@ -502,6 +721,7 @@ class DataService:
         Args:
             limit: Max products to return
             exclude_ids: Product IDs already in the candidate pool
+            seller_id: Seller requesting recommendations (for visibility filtering)
 
         Returns:
             List of product IDs
@@ -512,9 +732,9 @@ class DataService:
             exclude_ids = []
 
         try:
+            sid = seller_id or self._seller_id
             query = self.db.query(Product.id).filter(
-                Product.status == "AVAILABLE",
-                Product.isPublic == True,
+                self._product_visibility_filter(sid),
             )
             if exclude_ids:
                 query = query.filter(Product.id.notin_(exclude_ids))

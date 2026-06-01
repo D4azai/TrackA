@@ -1,12 +1,13 @@
 """
-Recommendation Algorithm — Production Ready
+Recommendation Algorithm — Production Ready (v2.2)
 
-Weighted ensemble of 5 signals:
-1. Popularity  (25%): Global trending products
+Weighted ensemble of 5 signals + negative penalty:
+1. Popularity  (25%): Global trending products (rank-normalized)
 2. History     (35%): Seller's past orders — with category affinity fallback
-3. Recency     (20%): When seller last ordered (seller-scoped)
-4. Newness     (15%): Product age
-5. Engagement  ( 5%): Likes and comments
+3. Recency     (20%): Reorder-window curve (inverse-U, peaks at 15-40 days)
+4. Newness     (10%): Product age
+5. Engagement  (10%): Likes and comments
+6. Negative    (penalty): Cancelled orders reduce final score
 
 Category Affinity (embedded in History signal):
   For products not in the seller's direct order history, the history score
@@ -14,9 +15,13 @@ Category Affinity (embedded in History signal):
   who frequently buy from a category will see new products from that category
   ranked higher — solving the cold-start product problem.
 
-Performance: ~7 database queries total (5 signals + 1 affinity + 1 fallback if needed)
+Candidate Pool: limit * 4 (wider pool gives diversity + scoring more room)
+
+Performance: ~8 database queries total (5 signals + affinity + negatives + fallback if needed)
 Response time target: <300ms (first load), <5ms (cache hit)
 """
+
+from __future__ import annotations
 
 import logging
 import time
@@ -42,17 +47,23 @@ settings = get_settings()
 # the exact product — rewards category familiarity but less than direct history.
 CATEGORY_AFFINITY_DISCOUNT = 0.45
 
+# Candidate pool multiplier: how many candidates to gather relative to the
+# requested limit. A wider pool gives the scoring and diversity steps more
+# room to find quality recommendations.
+CANDIDATE_POOL_MULTIPLIER = 4
+
 
 class RecommendationEngine:
     """
     Production recommendation engine.
 
     Signals & weights (configurable via environment):
-    - Popularity  (25%): Global trending products
+    - Popularity  (25%): Global trending products (rank-normalized)
     - History     (35%): Seller's past orders + category affinity fallback
-    - Recency     (20%): When seller last ordered (seller-scoped)
-    - Newness     (15%): Product age
-    - Engagement  ( 5%): Likes and comments
+    - Recency     (20%): Reorder-window curve (inverse-U)
+    - Newness     (10%): Product age
+    - Engagement  (10%): Likes and comments
+    - Negative penalty: Cancelled orders subtract from final score
     """
 
     def __init__(self, db_session: Session):
@@ -65,13 +76,17 @@ class RecommendationEngine:
         self,
         seller_id: str,
         limit: int = 30,
+        seller_type: str | None = None,
+        warehouse_id: int | None = None,
     ) -> List[Dict]:
         """
         Compute personalised recommendations for a seller.
 
         Args:
-            seller_id: Seller making request
-            limit:     Number of recommendations (max configured by MAX_LIMIT)
+            seller_id:    Seller making request
+            limit:        Number of recommendations (max configured by MAX_LIMIT)
+            seller_type:  Seller's tier (NORMAL/PRO/VIP) for product visibility
+            warehouse_id: Seller's fulfillment warehouse for stock filtering
 
         Returns:
             List of dicts with product_id, score, rank, sources, is_personalized
@@ -83,25 +98,34 @@ class RecommendationEngine:
         logger.info(f"Computing recommendations for seller {seller_id!r}, limit={limit}")
 
         limit = max(1, min(limit, self.settings.max_limit))
+        pool_size = limit * CANDIDATE_POOL_MULTIPLIER
+
+        # Use a seller-scoped data service for visibility + stock filtering
+        data_service = DataService(
+            self.db,
+            seller_id=seller_id,
+            seller_type=seller_type,
+            warehouse_id=warehouse_id,
+        )
 
         # ======================================================
-        # STEP 1: GATHER CANDIDATES
+        # STEP 1: GATHER CANDIDATES (wider pool for better diversity)
         # Primary sources: global popularity + seller history
         # Fallback: full catalog (sorted by rating) when pool is thin
         # ======================================================
-        popular = self.data_service.get_popular_products(limit=limit * 2)
-        history = self.data_service.get_seller_order_history(seller_id, limit=limit * 2)
+        popular = data_service.get_popular_products(limit=pool_size)
+        history = data_service.get_seller_order_history(seller_id, limit=pool_size)
 
         popularity_map: Dict[int, float] = {
             item["product_id"]: item["score"] for item in popular
         }
 
-        candidate_ids = self._build_candidate_ids(popular, history, limit)
+        candidate_ids = self._build_candidate_ids(popular, history, pool_size)
 
         # Catalog fallback — pad pool when popularity + history are thin
-        needed = (limit * 2) - len(candidate_ids)
+        needed = pool_size - len(candidate_ids)
         if needed > 0:
-            fallback_ids = self.data_service.get_catalog_fallback_products(
+            fallback_ids = data_service.get_catalog_fallback_products(
                 limit=needed,
                 exclude_ids=candidate_ids,
             )
@@ -112,7 +136,12 @@ class RecommendationEngine:
                     f"(pool was thin: {len(candidate_ids) - len(fallback_ids)} from popularity/history)"
                 )
 
-        candidate_ids = candidate_ids[: limit * 2]
+        candidate_ids = candidate_ids[:pool_size]
+
+        # Stock availability filter — remove products with zero stock in seller's warehouse
+        if warehouse_id:
+            in_stock_ids = data_service._get_in_stock_product_ids(candidate_ids)
+            candidate_ids = [pid for pid in candidate_ids if pid in in_stock_ids]
 
         if not candidate_ids:
             logger.warning(
@@ -124,17 +153,19 @@ class RecommendationEngine:
 
         logger.info(
             f"Candidate pool: {len(candidate_ids)} products for seller {seller_id!r}. "
-            f"(Popular: {len(popular)}, History: {len(history)}, Fallback added: {len(fallback_ids) if needed > 0 else 0})"
+            f"(Popular: {len(popular)}, History: {len(history)}, "
+            f"Fallback added: {len(fallback_ids) if needed > 0 else 0})"
         )
 
         # ======================================================
         # STEP 2: BATCH-FETCH ALL SIGNALS
         # Each call is a single DB query — no N+1 patterns
         # ======================================================
-        engagement_data  = self.data_service.get_engagement_scores_batch(candidate_ids)
-        recency_data     = self.data_service.get_recency_scores_batch(seller_id, candidate_ids)
-        newness_data     = self.data_service.get_newness_scores_batch(candidate_ids)
-        affinity_data    = self.data_service.get_category_affinity_scores(seller_id, candidate_ids)
+        engagement_data  = data_service.get_engagement_scores_batch(candidate_ids)
+        recency_data     = data_service.get_recency_scores_batch(seller_id, candidate_ids)
+        newness_data     = data_service.get_newness_scores_batch(candidate_ids)
+        affinity_data    = data_service.get_category_affinity_scores(seller_id, candidate_ids)
+        negative_data    = data_service.get_negative_signals_batch(seller_id, candidate_ids)
 
         # Get dynamic ML weights based on seller history size
         weights = self.ml_optimizer.get_weights_for_seller(seller_history_size=len(history))
@@ -145,7 +176,7 @@ class RecommendationEngine:
         scored: List[Dict] = []
 
         for product_id in candidate_ids:
-            # 1. POPULARITY — global trending (same for all sellers)
+            # 1. POPULARITY — global trending (rank-normalized, same for all sellers)
             popularity_score = popularity_map.get(product_id, 0.0)
 
             # 2. HISTORY — seller's past orders (strongest personalisation signal)
@@ -155,7 +186,7 @@ class RecommendationEngine:
             cat_affinity  = affinity_data.get(product_id, 0.0)
             history_score = exact_history if exact_history > 0 else (cat_affinity * CATEGORY_AFFINITY_DISCOUNT)
 
-            # 3. RECENCY — seller-scoped: when did THIS seller last order this product
+            # 3. RECENCY — seller-scoped reorder window (inverse-U curve)
             recency_score    = recency_data.get(product_id, {}).get("recency_score", 0.0)
 
             # 4. NEWNESS — product age (same for all sellers)
@@ -164,13 +195,18 @@ class RecommendationEngine:
             # 5. ENGAGEMENT — global likes + comments
             engagement_score = engagement_data.get(product_id, {}).get("engagement_score", 0.0)
 
-            final_score = (
+            # Weighted sum of positive signals
+            positive_score = (
                 popularity_score  * weights["popularity"]  +
                 history_score     * weights["history"]     +
                 recency_score     * weights["recency"]     +
                 newness_score     * weights["newness"]     +
                 engagement_score  * weights["engagement"]
             )
+
+            # 6. NEGATIVE PENALTY — cancelled orders reduce the score
+            penalty = negative_data.get(product_id, {}).get("penalty_score", 0.0)
+            final_score = max(positive_score - penalty, 0.0)
 
             if final_score < self.settings.min_score_threshold:
                 continue
@@ -194,7 +230,7 @@ class RecommendationEngine:
         # STEP 4: RANK AND RETURN TOP N WITH DIVERSITY
         # ======================================================
         scored.sort(key=lambda x: (-x["score"], x["product_id"]))
-        product_details = self.data_service.get_product_details([s["product_id"] for s in scored])
+        product_details = data_service.get_product_details([s["product_id"] for s in scored])
         
         final_recommendations = []
         category_counts = {}
@@ -228,8 +264,8 @@ class RecommendationEngine:
         if exploration_count > 0 and rejected:
             exploration_items = random.sample(rejected, min(exploration_count, len(rejected)))
             for item in exploration_items:
-                item["score"] = round(item["score"] * 1.5, 2)  # Boost to ensure visibility
-                item["is_personalized"] = False # Exploration items are considered non-personalized
+                item["is_personalized"] = False
+                item["is_exploration"] = True
             final_recommendations.extend(exploration_items)
             
         final_recommendations.sort(key=lambda x: (-x["score"], x["product_id"]))
@@ -267,7 +303,7 @@ class RecommendationEngine:
     def _build_candidate_ids(
         popular: List[Dict],
         history: Dict[int, Dict],
-        limit: int,
+        pool_size: int,
     ) -> List[int]:
         """
         Build a deterministic candidate pool.
@@ -289,4 +325,4 @@ class RecommendationEngine:
                 candidate_ids.append(product_id)
                 seen.add(product_id)
 
-        return candidate_ids[: limit * 2]
+        return candidate_ids[:pool_size]

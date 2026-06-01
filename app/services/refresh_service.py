@@ -2,6 +2,8 @@
 Background refresh orchestration for recommendations.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from datetime import datetime
 import logging
@@ -195,6 +197,8 @@ class RecommendationRefreshService:
         trigger: str,
         commit: bool = True,
         warm_cache: bool = True,
+        seller_type: str | None = None,
+        warehouse_id: int | None = None,
     ) -> List[Dict]:
         """
         Compute, persist, and optionally cache a full recommendation snapshot for one seller.
@@ -204,6 +208,8 @@ class RecommendationRefreshService:
         recommendations = self.recommendation_engine.compute_recommendations(
             seller_id,
             compute_limit,
+            seller_type=seller_type,
+            warehouse_id=warehouse_id,
         )
         self.precomputed_service.replace_seller_recommendations(
             seller_id=seller_id,

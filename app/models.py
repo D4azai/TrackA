@@ -21,6 +21,10 @@ from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
 
+# Seller type hierarchy for product visibility enforcement.
+# Higher index = higher tier = can see more products.
+SELLER_TYPE_HIERARCHY = {"NORMAL": 0, "PRO": 1, "VIP": 2}
+
 
 class User(Base):
     """User/Seller model."""
@@ -53,12 +57,14 @@ class Product(Base):
     status = Column(String, default="AVAILABLE")  # DRAFT, AVAILABLE, SOLD_OUT
     isPublic = Column(Boolean, default=True)
     allowedSellerIds = Column(JSON, default=list)
+    minimumSellerType = Column(String, default="NORMAL")  # NORMAL, PRO, VIP
 
     # Relationships
     category = relationship("Category", back_populates="products")
     order_items = relationship("OrderItem", back_populates="product")
     reactions = relationship("ProductReaction", back_populates="product")
     comments = relationship("ProductComment", back_populates="product")
+    variant_assignments = relationship("ProductVariantAssignment", back_populates="product")
 
 
 class Order(Base):
@@ -67,7 +73,8 @@ class Order(Base):
 
     id = Column(Integer, primary_key=True)
     sellerId = Column(String, ForeignKey("User.id"))
-    status = Column(String)  # PENDING, CONFIRMED, COMPLETED, CANCELLED
+    status = Column(String)  # NOT_CONFIRMED, CONFIRMED, COMPLETED, CANCELLED, etc.
+    fulfillmentWarehouseId = Column(Integer, ForeignKey("Warehouse.id"), nullable=True)
     createdAt = Column(DateTime, server_default=func.now())
     updatedAt = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -129,6 +136,55 @@ class Category(Base):
 
     # Relationships
     products = relationship("Product", back_populates="category")
+
+
+class Warehouse(Base):
+    """Warehouse/fulfillment center."""
+    __tablename__ = "Warehouse"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    isActive = Column(Boolean, default=True)
+    createdAt = Column(DateTime, server_default=func.now())
+    updatedAt = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    # Relationships
+    stocks = relationship("WarehouseStock", back_populates="warehouse")
+
+
+class ProductVariantAssignment(Base):
+    """Links a product to a specific variant (color/size combination)."""
+    __tablename__ = "ProductVariantAssignment"
+
+    id = Column(Integer, primary_key=True)
+    productId = Column(Integer, ForeignKey("Product.id"))
+    isActive = Column(Boolean, default=True)
+    createdAt = Column(DateTime, server_default=func.now())
+
+    # Relationships
+    product = relationship("Product", back_populates="variant_assignments")
+    warehouse_stocks = relationship("WarehouseStock", back_populates="variant_assignment")
+
+
+class WarehouseStock(Base):
+    """Stock levels per product variant per warehouse."""
+    __tablename__ = "WarehouseStock"
+
+    id = Column(Integer, primary_key=True)
+    warehouseId = Column(Integer, ForeignKey("Warehouse.id"))
+    productVariantAssignmentId = Column(Integer, ForeignKey("ProductVariantAssignment.id"))
+    quantity = Column(Integer, default=0)
+    reservedQuantity = Column(Integer, default=0)
+    createdAt = Column(DateTime, server_default=func.now())
+    updatedAt = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    # Relationships
+    warehouse = relationship("Warehouse", back_populates="stocks")
+    variant_assignment = relationship("ProductVariantAssignment", back_populates="warehouse_stocks")
+
+    __table_args__ = (
+        Index("ix_warehousestock_warehouse_variant", "warehouseId", "productVariantAssignmentId", unique=True),
+    )
 
 
 class SellerRecommendation(Base):

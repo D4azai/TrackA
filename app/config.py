@@ -60,9 +60,9 @@ class Settings(BaseSettings):
     # ============= ALGORITHM =============
     weight_popularity: float = Field(default=0.25, ge=0, le=1, description="Popularity signal weight")
     weight_history: float = Field(default=0.35, ge=0, le=1, description="History signal weight")
-    weight_engagement: float = Field(default=0.05, ge=0, le=1, description="Engagement signal weight")
+    weight_engagement: float = Field(default=0.10, ge=0, le=1, description="Engagement signal weight")
     weight_recency: float = Field(default=0.20, ge=0, le=1, description="Recency signal weight")
-    weight_newness: float = Field(default=0.15, ge=0, le=1, description="Newness signal weight")
+    weight_newness: float = Field(default=0.10, ge=0, le=1, description="Newness signal weight")
 
     max_limit: int = Field(default=100, ge=1, description="Maximum recommendations per request")
     min_score_threshold: float = Field(default=0.0, description="Minimum score to include in results")
